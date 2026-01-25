@@ -3,6 +3,7 @@
 **By Alexander 'xaitax' Hagenah**
 
 *Initial release: January 11, 2026*
+
 *Updated: January 25, 2026 - Added Brave 144 analysis, comprehensive browser comparison table*
 
 Remember when bypassing Chrome's App-Bound Encryption (ABE) felt like you had finally cracked the code? Well, the Chromium team has been busy. Starting with Chrome 144, a new player enters the scene: `IElevator2`. The existing `IElevator` interface isn't going anywhere, but there's now a v2 sibling sitting alongside it - and the commit message is refreshingly candid about why.
@@ -277,7 +278,7 @@ total_interfaces_scanned: 12
 abe_capable_interfaces_found: 11
 ```
 
-Edge has 12 interfaces - same count as Chrome 144 - but the composition tells a different story:
+Edge has 12 interfaces total (11 ABE-capable) - same count as Chrome 144 - but the composition tells a different story. The table below shows the 11 ABE-capable interfaces from the analysis:
 
 | Interface | IID | Notes |
 |-----------|-----|-------|
@@ -358,13 +359,13 @@ Unlike Edge (which shares Chrome's base `IElevator` IID), Brave uses its own: `{
 
 Here's where it gets interesting: despite having different base IElevator IIDs, Brave deliberately reuses Chrome's `IElevator2Chrome` IID (`{1BF5208B-295F-4992-B5F4-3A9BB6494838}`). This is a conscious choice for forward compatibility - when the Mojo migration eventually happens, Brave can piggyback on Chrome's implementation without maintaining separate infrastructure.
 
-**3. VTable Layout Matches Chrome**
+**3. VTable Layout Matches Chrome (Mostly)**
 
-Unlike Edge's offset quirk, Brave maintains Chrome's vtable layout:
+Unlike Edge's offset quirk, Brave maintains Chrome's vtable layout for the ABE-relevant methods:
 - `EncryptData`: offset 32 bytes (same as Chrome)
 - `DecryptData`: offset 40 bytes (same as Chrome)
 
-This means the same code path works for both Chrome and Brave - no special handling required.
+Interestingly, Brave's base `IElevator` interface defines 4 methods versus Chrome's 3 - there's an additional method somewhere in Brave's interface that the ABE analyzer doesn't track (since it only looks for `EncryptData`/`DecryptData`). However, since the offsets for the encryption methods are identical, this extra method doesn't affect ABE functionality. The same code path works for both Chrome and Brave.
 
 **4. Unique IElevatorDevelopment Interface**
 
@@ -385,7 +386,7 @@ With all three major Chromium browsers now on version 144, here's a comprehensiv
 | **Elevation Service CLSID** | `{708860E0-F641-4611-8895-7D867DD3675B}` | `{1FCBE96C-1697-43AF-9140-2897C7C69767}` | `{576B31AF-6369-4B6B-8560-E4B203A97A8B}` |
 | **Base IElevator IID** | `{A949CB4E-C4F9-44C4-B213-6BF8AA9AC69C}` | `{A949CB4E-C4F9-44C4-B213-6BF8AA9AC69C}` | `{5A9A9462-2FA1-4FEB-B7F2-DF3D19134463}` |
 | **IElevator2 Base IID** | `{8F7B6792-...}` | `{8F7B6792-...}` | `{8F7B6792-...}` |
-| **IElevator2 Vendor Variants** | Full set (6) | None | Full set (6) |
+| **IElevator2 Family** | All 6 (base + 5 variants) | Base only | All 6 (base + 5 variants) |
 | **EncryptData Offset** | 32 bytes | 56 bytes | 32 bytes |
 | **DecryptData Offset** | 40 bytes | 64 bytes | 40 bytes |
 | **Unique Interfaces** | - | Copilot (3) | Development (1) |
