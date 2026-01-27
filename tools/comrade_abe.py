@@ -1,34 +1,88 @@
 #!/usr/bin/env python3
+"""
+COMrade ABE - COM App-Bound Encryption Interface Analyzer
+Discovers and analyzes COM interfaces for Chromium-based browser elevation services.
+"""
 
 import argparse
 import ctypes
+import io
 import json
 import logging
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+# Configure stdout encoding for Windows
+if sys.platform == "win32":
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import comtypes
-import comtypes.typeinfo
 import comtypes.automation
+import comtypes.typeinfo
 import winreg
-from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Any, Optional
 
 try:
     import pefile
 except ImportError:
     pefile = None
 
-EMOJI_SUCCESS = "✅"
-EMOJI_FAILURE = "❌"
-EMOJI_INFO = "ℹ️"
-EMOJI_SEARCH = "🔍"
-EMOJI_GEAR = "⚙️"
-EMOJI_FILE = "📄"
-EMOJI_LIGHTBULB = "💡"
-EMOJI_WARNING = "⚠️"
 
+def _supports_unicode() -> bool:
+    """Check if terminal supports Unicode output."""
+    if sys.platform != "win32":
+        return True
+    try:
+        # Check if we're in Windows Terminal or other Unicode-capable terminal
+        return os.environ.get("WT_SESSION") is not None or os.environ.get("TERM_PROGRAM") is not None
+    except Exception:
+        return False
+
+
+# Use ASCII fallbacks if Unicode not supported
+_USE_UNICODE = _supports_unicode()
+
+# Constants
+EMOJI = {
+    "success": "[+]" if not _USE_UNICODE else "✅",
+    "failure": "[-]" if not _USE_UNICODE else "❌",
+    "info": "[i]" if not _USE_UNICODE else "ℹ️",
+    "search": "[?]" if not _USE_UNICODE else "🔍",
+    "gear": "[*]" if not _USE_UNICODE else "⚙️",
+    "file": "[F]" if not _USE_UNICODE else "📄",
+    "lightbulb": "[!]" if not _USE_UNICODE else "💡",
+    "warning": "[!]" if not _USE_UNICODE else "⚠️"
+}
+
+START_TYPE_MAP = {0: "Boot", 1: "System", 2: "Automatic", 3: "Manual", 4: "Disabled"}
+
+# Known browser service patterns
+BROWSER_SERVICES = {
+    "chrome": ["GoogleChromeElevationService", "GoogleChromeCanaryElevationService",
+               "GoogleChromeBetaElevationService", "GoogleChromeDevElevationService"],
+    "edge": ["MicrosoftEdgeElevationService", "MicrosoftEdgeCanaryElevationService",
+             "MicrosoftEdgeBetaElevationService", "MicrosoftEdgeDevElevationService"],
+    "brave": ["BraveElevationService", "BraveBetaElevationService", "BraveNightlyElevationService"],
+}
+
+# Known interface IIDs for primary detection
+KNOWN_PRIMARY_IIDS = {
+    "chrome": "{463ABECF-410D-407F-8AF5-0DF35A005CC8}",
+    "edge": "{C9C2B807-7731-4F34-81B7-44FF7779522B}",
+    "brave": "{F396861E-0C8E-4C71-8256-2FAE6D759CE9}",
+}
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
 
 @dataclass
 class MethodDetail:
@@ -68,8 +122,154 @@ class AbeCandidate:
     inheritance_chain_info: List[InterfaceInfo]
 
 
-def get_vt_name(vt_code, type_info_context=None, hreftype_or_tdesc_for_ptr=None):
-    mapping = {
+@dataclass
+class VtableSlotInfo:
+    method_name: str
+    slot_index: int
+    offset_x64: int
+    offset_x86: int
+    defining_interface: str
+    memid: int = 0
+
+
+@dataclass
+class CoclassInfo:
+    name: str
+    clsid: str
+    implemented_interfaces: List[Dict[str, Any]] = field(default_factory=list)
+    threading_model: Optional[str] = None
+    server_type: Optional[str] = None
+    server_path: Optional[str] = None
+
+
+@dataclass
+class ProxyStubInfo:
+    iid: str
+    name: Optional[str] = None
+    registered: bool = True
+    marshaling_type: str = "unknown"
+    proxy_stub_clsid: Optional[str] = None
+    proxy_stub_dll: Optional[str] = None
+    typelib_id: Optional[str] = None
+    typelib_version: Optional[str] = None
+
+
+@dataclass
+class ComSecurityInfo:
+    clsid: str
+    appid: Optional[str] = None
+    runas: Optional[str] = None
+    dll_surrogate: Optional[str] = None
+    local_service: Optional[str] = None
+    has_launch_permission: bool = False
+    has_access_permission: bool = False
+    launch_permission_size: int = 0
+    access_permission_size: int = 0
+    launch_permission_sddl: Optional[str] = None
+    access_permission_sddl: Optional[str] = None
+
+
+@dataclass
+class PeTypelibInfo:
+    machine: Optional[str] = None
+    machine_name: Optional[str] = None
+    timestamp: Optional[str] = None
+    has_embedded_typelib: bool = False
+    typelib_count: int = 0
+    uses_rpc: bool = False
+    uses_ole: bool = False
+    imports: List[str] = field(default_factory=list)
+    hardening_apis: List[str] = field(default_factory=list)
+    pe_error: Optional[str] = None
+
+
+@dataclass
+class ElevationServiceInfo:
+    service_name: str
+    display_name: Optional[str] = None
+    executable_path: Optional[str] = None
+    description: Optional[str] = None
+    start_type: Optional[str] = None
+    status: Optional[str] = None
+    pid: Optional[int] = None
+    browser_vendor: Optional[str] = None
+
+
+@dataclass
+class ServiceRuntimeInfo:
+    service_name: str
+    status: str = "unknown"
+    pid: Optional[int] = None
+    start_type: str = "unknown"
+    can_stop: bool = False
+    can_pause: bool = False
+    dependencies: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+
+
+@dataclass
+class TypeLibRegistryInfo:
+    typelib_id: str
+    name: Optional[str] = None
+    version: Optional[str] = None
+    lcid: Optional[str] = None
+    win32_path: Optional[str] = None
+    win64_path: Optional[str] = None
+    helpdir: Optional[str] = None
+    flags: Optional[int] = None
+
+
+# =============================================================================
+# Registry Helpers
+# =============================================================================
+
+def reg_read_value(hkey: int, subkey: str, value_name: Optional[str] = None,
+                   wow64_64: bool = True) -> Optional[Any]:
+    """Read a single registry value, returning None if not found."""
+    try:
+        access = winreg.KEY_READ | (winreg.KEY_WOW64_64KEY if wow64_64 else 0)
+        with winreg.OpenKey(hkey, subkey, 0, access) as key:
+            return winreg.QueryValueEx(key, value_name)[0]
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def reg_enum_subkeys(hkey: int, subkey: str, wow64_64: bool = True) -> List[str]:
+    """Enumerate subkeys under a registry key."""
+    result = []
+    try:
+        access = winreg.KEY_READ | (winreg.KEY_WOW64_64KEY if wow64_64 else 0)
+        with winreg.OpenKey(hkey, subkey, 0, access) as key:
+            i = 0
+            while True:
+                try:
+                    result.append(winreg.EnumKey(key, i))
+                    i += 1
+                except OSError:
+                    break
+    except (FileNotFoundError, OSError):
+        pass
+    return result
+
+
+def clean_executable_path(raw_path: str) -> str:
+    """Extract executable path from ImagePath or LocalServer32 value."""
+    if not raw_path:
+        return ""
+    path = raw_path.strip()
+    if path.startswith('"'):
+        parts = path.split('"')
+        return os.path.normpath(parts[1]) if len(parts) > 1 else ""
+    return os.path.normpath(path.split()[0])
+
+
+# =============================================================================
+# COM Type Helpers
+# =============================================================================
+
+def get_vt_name(vt_code: int, type_info_context=None, hreftype_or_tdesc=None) -> str:
+    """Convert VARIANT type code to C++ type name."""
+    VT_MAP = {
         comtypes.automation.VT_EMPTY: "void", comtypes.automation.VT_NULL: "void*",
         comtypes.automation.VT_I2: "SHORT", comtypes.automation.VT_I4: "LONG",
         comtypes.automation.VT_R4: "FLOAT", comtypes.automation.VT_R8: "DOUBLE",
@@ -80,54 +280,46 @@ def get_vt_name(vt_code, type_info_context=None, hreftype_or_tdesc_for_ptr=None)
         comtypes.automation.VT_DECIMAL: "DECIMAL", comtypes.automation.VT_UI1: "BYTE",
         comtypes.automation.VT_I1: "CHAR", comtypes.automation.VT_UI2: "USHORT",
         comtypes.automation.VT_UI4: "ULONG", comtypes.automation.VT_I8: "hyper",
-        comtypes.automation.VT_UI8: "uhyper",
-        comtypes.automation.VT_INT: "INT", comtypes.automation.VT_UINT: "UINT",
-        comtypes.automation.VT_VOID: "void", comtypes.automation.VT_HRESULT: "HRESULT",
-        comtypes.automation.VT_PTR: "void*",
-        comtypes.automation.VT_SAFEARRAY: "SAFEARRAY",
-        comtypes.automation.VT_CARRAY: "CARRAY",
+        comtypes.automation.VT_UI8: "uhyper", comtypes.automation.VT_INT: "INT",
+        comtypes.automation.VT_UINT: "UINT", comtypes.automation.VT_VOID: "void",
+        comtypes.automation.VT_HRESULT: "HRESULT", comtypes.automation.VT_PTR: "void*",
+        comtypes.automation.VT_SAFEARRAY: "SAFEARRAY", comtypes.automation.VT_CARRAY: "CARRAY",
         comtypes.automation.VT_USERDEFINED: "USER_DEFINED",
         comtypes.automation.VT_LPSTR: "LPSTR", comtypes.automation.VT_LPWSTR: "LPWSTR",
         64: "FILETIME", 65: "BLOB",
     }
+
     is_byref = bool(vt_code & comtypes.automation.VT_BYREF)
     is_array = bool(vt_code & comtypes.automation.VT_ARRAY)
-    is_vector = bool(vt_code & comtypes.automation.VT_VECTOR)
-    base_vt = vt_code & ~(comtypes.automation.VT_BYREF |
-                          comtypes.automation.VT_ARRAY | comtypes.automation.VT_VECTOR)
-    name = mapping.get(base_vt, f"Unknown_VT_0x{base_vt:X}")
+    base_vt = vt_code & ~(comtypes.automation.VT_BYREF | comtypes.automation.VT_ARRAY |
+                          comtypes.automation.VT_VECTOR)
+    name = VT_MAP.get(base_vt, f"Unknown_VT_0x{base_vt:X}")
 
-    if base_vt == comtypes.automation.VT_USERDEFINED and type_info_context and isinstance(hreftype_or_tdesc_for_ptr, int):
-        ref_type_info_local = ref_attr_local = None
+    if base_vt == comtypes.automation.VT_USERDEFINED and type_info_context and isinstance(hreftype_or_tdesc, int):
         try:
-            ref_type_info_local = type_info_context.GetRefTypeInfo(
-                hreftype_or_tdesc_for_ptr)
-            udt_name, _, _, _ = ref_type_info_local.GetDocumentation(-1)
-            ref_attr_local = ref_type_info_local.GetTypeAttr()
+            ref_ti = type_info_context.GetRefTypeInfo(hreftype_or_tdesc)
+            udt_name, _, _, _ = ref_ti.GetDocumentation(-1)
+            ref_attr = ref_ti.GetTypeAttr()
             name = udt_name
+            ref_ti.ReleaseTypeAttr(ref_attr)
         except comtypes.COMError:
-            name = f"UserDefined_hreftype_{hreftype_or_tdesc_for_ptr}"
-        finally:
-            if ref_attr_local and ref_type_info_local:
-                ref_type_info_local.ReleaseTypeAttr(ref_attr_local)
-    elif base_vt == comtypes.automation.VT_PTR and type_info_context and hasattr(hreftype_or_tdesc_for_ptr, 'lptdesc') and hreftype_or_tdesc_for_ptr.lptdesc:
-        pointed_tdesc = hreftype_or_tdesc_for_ptr.lptdesc.contents
-        next_arg_for_recursive_call = pointed_tdesc.hreftype if pointed_tdesc.vt == comtypes.automation.VT_USERDEFINED else pointed_tdesc
-        pointed_name = get_vt_name(
-            pointed_tdesc.vt, type_info_context, next_arg_for_recursive_call)
-        name = f"{pointed_name}*"
+            name = f"UserDefined_hreftype_{hreftype_or_tdesc}"
+    elif base_vt == comtypes.automation.VT_PTR and type_info_context:
+        if hasattr(hreftype_or_tdesc, 'lptdesc') and hreftype_or_tdesc.lptdesc:
+            pointed = hreftype_or_tdesc.lptdesc.contents
+            next_arg = pointed.hreftype if pointed.vt == comtypes.automation.VT_USERDEFINED else pointed
+            name = f"{get_vt_name(pointed.vt, type_info_context, next_arg)}*"
 
     if is_array:
         name = f"SAFEARRAY({name})"
-    if is_vector:
-        name = f"VECTOR_OF({name})"
     if is_byref and not name.endswith("*"):
         name = f"{name}*"
     return name
 
 
-def get_param_flags_string(flags):
-    flag_map = {
+def get_param_flags_string(flags: int) -> str:
+    """Convert parameter flags to string."""
+    FLAG_MAP = {
         comtypes.typeinfo.PARAMFLAG_FIN: "in",
         comtypes.typeinfo.PARAMFLAG_FOUT: "out",
         comtypes.typeinfo.PARAMFLAG_FLCID: "lcid",
@@ -135,983 +327,1266 @@ def get_param_flags_string(flags):
         comtypes.typeinfo.PARAMFLAG_FOPT: "optional",
         comtypes.typeinfo.PARAMFLAG_FHASDEFAULT: "hasdefault",
     }
-    active_flags = [name for flag_val,
-                    name in flag_map.items() if flags & flag_val]
-    return ", ".join(active_flags) if active_flags else f"none (raw: 0x{flags:X})"
+    active = [name for flag, name in FLAG_MAP.items() if flags & flag]
+    return ", ".join(active) if active else f"none (0x{flags:X})"
 
 
-def get_typekind_name(tkind_code):
-    mapping = {
-        comtypes.typeinfo.TKIND_ENUM: "TKIND_ENUM", comtypes.typeinfo.TKIND_RECORD: "TKIND_RECORD",
-        comtypes.typeinfo.TKIND_MODULE: "TKIND_MODULE", comtypes.typeinfo.TKIND_INTERFACE: "TKIND_INTERFACE",
-        comtypes.typeinfo.TKIND_DISPATCH: "TKIND_DISPATCH", comtypes.typeinfo.TKIND_COCLASS: "TKIND_COCLASS",
-        comtypes.typeinfo.TKIND_ALIAS: "TKIND_ALIAS", comtypes.typeinfo.TKIND_UNION: "TKIND_UNION",
-        comtypes.typeinfo.TKIND_MAX: "TKIND_MAX (Not a kind)"
+def resolve_type_deep(type_info_context, tdesc, history: set = None, depth: int = 0) -> str:
+    """
+    Recursively resolve type definitions including struct/enum internals.
+
+    For structs (TKIND_RECORD), returns: struct { field1_type field1; field2_type field2; }
+    For enums (TKIND_ENUM), returns: enum EnumName
+    For pointers, recursively resolves the pointed-to type.
+
+    Args:
+        type_info_context: ITypeInfo for resolving references
+        tdesc: TYPEDESC structure describing the type
+        history: Set of already-visited type names to prevent infinite recursion
+        depth: Current recursion depth (max 3 to prevent excessive nesting)
+    """
+    if history is None:
+        history = set()
+
+    MAX_DEPTH = 3
+    if depth > MAX_DEPTH:
+        return "..."
+
+    vt = tdesc.vt
+    is_byref = bool(vt & comtypes.automation.VT_BYREF)
+    base_vt = vt & ~(comtypes.automation.VT_BYREF | comtypes.automation.VT_ARRAY |
+                     comtypes.automation.VT_VECTOR)
+
+    # Basic type mapping
+    VT_MAP = {
+        comtypes.automation.VT_EMPTY: "void", comtypes.automation.VT_NULL: "void*",
+        comtypes.automation.VT_I2: "SHORT", comtypes.automation.VT_I4: "LONG",
+        comtypes.automation.VT_R4: "FLOAT", comtypes.automation.VT_R8: "DOUBLE",
+        comtypes.automation.VT_BSTR: "BSTR", comtypes.automation.VT_DISPATCH: "IDispatch*",
+        comtypes.automation.VT_BOOL: "VARIANT_BOOL", comtypes.automation.VT_UNKNOWN: "IUnknown*",
+        comtypes.automation.VT_UI1: "BYTE", comtypes.automation.VT_I1: "CHAR",
+        comtypes.automation.VT_UI2: "USHORT", comtypes.automation.VT_UI4: "ULONG",
+        comtypes.automation.VT_I8: "LONGLONG", comtypes.automation.VT_UI8: "ULONGLONG",
+        comtypes.automation.VT_INT: "INT", comtypes.automation.VT_UINT: "UINT",
+        comtypes.automation.VT_VOID: "void", comtypes.automation.VT_HRESULT: "HRESULT",
+        comtypes.automation.VT_LPSTR: "LPSTR", comtypes.automation.VT_LPWSTR: "LPWSTR",
     }
-    return mapping.get(tkind_code, f"Unknown TKIND (0x{tkind_code:X})")
 
+    # Handle pointer types
+    if base_vt == comtypes.automation.VT_PTR:
+        if hasattr(tdesc, 'lptdesc') and tdesc.lptdesc:
+            pointed = tdesc.lptdesc.contents
+            inner = resolve_type_deep(type_info_context, pointed, history, depth + 1)
+            return f"{inner}*"
+        return "void*"
 
-def format_guid_for_cpp(guid_str_or_obj):
-    default_zero_guid_cpp = "{0x00000000,0x0000,0x0000,{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}}"
-    if not guid_str_or_obj:
-        return default_zero_guid_cpp
-
-    g_obj = None
-    if isinstance(guid_str_or_obj, str):
-        guid_str_lower = guid_str_or_obj.lower()
-        if guid_str_lower in ["unknown", "unknown (not discoverable from tlb)",
-                              "n/a (direct interface scan)",
-                              "unknown (not explicitly found for this interface)",
-                              "unknown (not explicitly found for this coclass)"]:
-            return default_zero_guid_cpp
+    # Handle user-defined types (structs, enums, interfaces)
+    if base_vt == comtypes.automation.VT_USERDEFINED:
         try:
-            g_obj = comtypes.GUID(guid_str_or_obj)
-        except ValueError:
-            return f"{{ /* Error: Invalid GUID string format: '{guid_str_or_obj}' */ }}"
-        except Exception as e:
-            return f"{{ /* Error parsing GUID string '{guid_str_or_obj}': {e} */ }}"
-    elif isinstance(guid_str_or_obj, comtypes.GUID):
-        g_obj = guid_str_or_obj
-    else:
-        return f"{{ /* Error: Invalid input type for GUID formatting. Expected str or comtypes.GUID. */ }}"
+            href = tdesc.hreftype
+            ref_ti = type_info_context.GetRefTypeInfo(href)
+            ref_attr = ref_ti.GetTypeAttr()
+            udt_name, _, _, _ = ref_ti.GetDocumentation(-1)
+            type_kind = ref_attr.typekind
 
-    if not g_obj:
-        return default_zero_guid_cpp
+            # Prevent infinite recursion for self-referential types
+            if udt_name in history:
+                ref_ti.ReleaseTypeAttr(ref_attr)
+                suffix = "*" if is_byref else ""
+                return f"{udt_name}{suffix} /*recursive*/"
 
-    data4_raw_elements = g_obj.Data4
-    data4_unsigned_bytes = []
+            history_copy = history | {udt_name}
+
+            # TKIND_RECORD = struct
+            if type_kind == comtypes.typeinfo.TKIND_RECORD:
+                fields = []
+                for i in range(ref_attr.cVars):
+                    try:
+                        vardesc = ref_ti.GetVarDesc(i)
+                        var_names = ref_ti.GetNames(vardesc.memid, 1)
+                        var_name = var_names[0] if var_names else f"field{i}"
+                        var_type = resolve_type_deep(ref_ti, vardesc.elemdescVar.tdesc,
+                                                     history_copy, depth + 1)
+                        fields.append(f"{var_type} {var_name}")
+                        ref_ti.ReleaseVarDesc(vardesc)
+                    except comtypes.COMError:
+                        fields.append(f"? field{i}")
+
+                ref_ti.ReleaseTypeAttr(ref_attr)
+                if fields:
+                    suffix = "*" if is_byref else ""
+                    return f"struct {udt_name} {{ {'; '.join(fields)}; }}{suffix}"
+                else:
+                    suffix = "*" if is_byref else ""
+                    return f"struct {udt_name}{suffix}"
+
+            # TKIND_ENUM = enum
+            elif type_kind == comtypes.typeinfo.TKIND_ENUM:
+                # Just return enum name; values are rarely needed inline
+                ref_ti.ReleaseTypeAttr(ref_attr)
+                return f"enum {udt_name}"
+
+            # TKIND_INTERFACE or TKIND_DISPATCH = interface pointer
+            elif type_kind in (comtypes.typeinfo.TKIND_INTERFACE,
+                               comtypes.typeinfo.TKIND_DISPATCH):
+                ref_ti.ReleaseTypeAttr(ref_attr)
+                return f"{udt_name}*"
+
+            # TKIND_ALIAS = typedef
+            elif type_kind == comtypes.typeinfo.TKIND_ALIAS:
+                # Resolve the aliased type
+                aliased = ref_attr.tdescAlias
+                ref_ti.ReleaseTypeAttr(ref_attr)
+                return resolve_type_deep(ref_ti, aliased, history_copy, depth + 1)
+
+            # Other kinds - just return the name
+            ref_ti.ReleaseTypeAttr(ref_attr)
+            suffix = "*" if is_byref else ""
+            return f"{udt_name}{suffix}"
+
+        except comtypes.COMError:
+            return f"UDT_hreftype_{tdesc.hreftype}"
+
+    # Basic type lookup
+    name = VT_MAP.get(base_vt, f"VT_0x{base_vt:X}")
+    if is_byref and not name.endswith("*"):
+        name = f"{name}*"
+    return name
+
+
+def format_guid_for_cpp(guid_str: Optional[str]) -> str:
+    """Format GUID string as C++ initializer."""
+    ZERO_GUID = "{0x00000000,0x0000,0x0000,{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}}"
+    if not guid_str or guid_str.lower().startswith("unknown"):
+        return ZERO_GUID
     try:
-        if len(data4_raw_elements) != 8:
-            return f"{{ /* Error: Data4 for GUID object '{str(g_obj)}' does not have length 8 (Len: {len(data4_raw_elements)}) */ }}"
-        for i in range(8):
-            data4_unsigned_bytes.append(data4_raw_elements[i] & 0xFF)
-    except (TypeError, IndexError):
-        return f"{{ /* Error: Data4 for GUID object '{str(g_obj)}' is not a proper 8-byte sequence (Type: {type(data4_raw_elements)}) */ }}"
+        g = comtypes.GUID(guid_str)
+        d4 = [g.Data4[i] & 0xFF for i in range(8)]
+        return (f"{{0x{g.Data1:08X},0x{g.Data2:04X},0x{g.Data3:04X},"
+                f"{{0x{d4[0]:02X},0x{d4[1]:02X},0x{d4[2]:02X},0x{d4[3]:02X},"
+                f"0x{d4[4]:02X},0x{d4[5]:02X},0x{d4[6]:02X},0x{d4[7]:02X}}}}}")
+    except (ValueError, Exception):
+        return ZERO_GUID
 
-    return (f"{{0x{g_obj.Data1:08X},0x{g_obj.Data2:04X},0x{g_obj.Data3:04X},"
-            f"{{0x{data4_unsigned_bytes[0]:02X},0x{data4_unsigned_bytes[1]:02X},0x{data4_unsigned_bytes[2]:02X},0x{data4_unsigned_bytes[3]:02X},"
-            f"0x{data4_unsigned_bytes[4]:02X},0x{data4_unsigned_bytes[5]:02X},0x{data4_unsigned_bytes[6]:02X},0x{data4_unsigned_bytes[7]:02X}}}}}")
 
+def decode_sddl(sd_bytes: bytes) -> Optional[str]:
+    """Convert binary security descriptor to SDDL string."""
+    try:
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+        sddl_ptr = ctypes.c_wchar_p()
+        sddl_len = ctypes.c_ulong()
+        # OWNER | GROUP | DACL
+        if advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                ctypes.c_char_p(sd_bytes), 1, 0x7, ctypes.byref(sddl_ptr), ctypes.byref(sddl_len)):
+            result = sddl_ptr.value
+            kernel32.LocalFree(sddl_ptr)
+            return result
+    except Exception:
+        pass
+    return None
+
+
+# =============================================================================
+# Main Analyzer Class
+# =============================================================================
 
 class ComInterfaceAnalyzer:
-    def __init__(self, executable_path=None, verbose=False, target_method_names=None,
-                 expected_decrypt_param_count=3, expected_encrypt_param_count=4,
-                 log_file=None):
+    def __init__(self, executable_path: str = None, verbose: bool = False,
+                 target_method_names: List[str] = None,
+                 expected_decrypt_params: int = 3, expected_encrypt_params: int = 4,
+                 log_file: str = None):
         self.executable_path = executable_path
-        self.args_verbose = verbose
-        self.type_lib: Optional[comtypes.POINTER(
-            comtypes.typeinfo.ITypeLib)] = None  # type: ignore
+        self.verbose = verbose
+        self.type_lib = None
         self.results: List[AbeCandidate] = []
         self.discovered_clsid: Optional[str] = None
         self.browser_key: Optional[str] = None
-        self.target_method_names = target_method_names if target_method_names else [
-            "DecryptData", "EncryptData"]
-        self.expected_param_counts = {
-            "DecryptData": expected_decrypt_param_count, "EncryptData": expected_encrypt_param_count}
-        
-        # Statistics tracking
+        self.target_methods = target_method_names or ["DecryptData", "EncryptData"]
+        self.expected_params = {"DecryptData": expected_decrypt_params,
+                                "EncryptData": expected_encrypt_params}
+
+        # Statistics
         self.start_time = None
         self.interfaces_scanned = 0
         self.interfaces_abe_capable = 0
-        
-        # Setup file logging if requested
+
+        # Caches
+        self.coclasses: List[CoclassInfo] = []
+        self.proxy_stub_cache: Dict[str, ProxyStubInfo] = {}
+        self.security_cache: Dict[str, ComSecurityInfo] = {}
+        self.pe_info: Optional[PeTypelibInfo] = None
+
+        # Setup logging
         self.logger = None
         if log_file:
             self.logger = logging.getLogger('ComradeABE')
             self.logger.setLevel(logging.DEBUG if verbose else logging.INFO)
             handler = logging.FileHandler(log_file, encoding='utf-8')
-            handler.setFormatter(logging.Formatter(
-                '%(asctime)s - %(levelname)s - %(message)s',
-                datefmt='%Y-%m-%d %H:%M:%S'
-            ))
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
             self.logger.addHandler(handler)
 
-    def _log(self, message: str, indent: int = 0, verbose_only: bool = False, status_emoji: Optional[str] = None):
-        if verbose_only and not self.args_verbose:
+    def _log(self, msg: str, indent: int = 0, verbose_only: bool = False, emoji: str = None):
+        """Print and optionally log a message."""
+        if verbose_only and not self.verbose:
             return
-        prefix = f"{status_emoji} " if status_emoji else ""
-        formatted_msg = f"{'  ' * indent}{prefix}{message}"
-        print(formatted_msg)
-        
-        # Also log to file if logger is set
+        prefix = f"{EMOJI.get(emoji, '')} " if emoji else ""
+        print(f"{'  ' * indent}{prefix}{msg}")
         if self.logger:
-            # Remove emoji for cleaner log file
-            clean_msg = message
-            level = logging.DEBUG if verbose_only else logging.INFO
-            self.logger.log(level, clean_msg)
+            self.logger.log(logging.DEBUG if verbose_only else logging.INFO, msg)
 
-    def load_type_library(self) -> bool:
-        if not self.executable_path:
-            self._log("Executable path not set for TypeLib loading.",
-                      status_emoji=EMOJI_FAILURE)
-            return False
-        self._log(
-            f"{EMOJI_SEARCH} Attempting to load type library from: {self.executable_path}")
-        try:
-            self.type_lib = comtypes.typeinfo.LoadTypeLibEx(
-                self.executable_path)
-            lib_name, _, _, _ = self.type_lib.GetDocumentation(-1)
-            self._log(
-                f"{EMOJI_SUCCESS} Successfully loaded type library: '{lib_name}'")
-            return True
-        except comtypes.COMError as e:
-            self._log(f"{EMOJI_FAILURE} COMError loading type library: {e}", 1)
-        except Exception as e_gen:
-            self._log(
-                f"{EMOJI_FAILURE} Generic error loading type library: {e_gen}", 1)
-        return False
+    # -------------------------------------------------------------------------
+    # Registry-based Discovery
+    # -------------------------------------------------------------------------
 
-    def find_details_from_registry_by_service_name(self, browser_name_key: str) -> bool:
-        self.browser_key = browser_name_key.lower()
-        self._log(
-            f"{EMOJI_SEARCH} Scanning registry for service details of '{self.browser_key}'...")
-        service_map = {"chrome": "GoogleChromeElevationService",
-                       "edge": "MicrosoftEdgeElevationService", "brave": "BraveElevationService"}
-        service_name = service_map.get(self.browser_key, browser_name_key)
-        self._log(
-            f"Targeting service name: '{service_name}'", indent=1, verbose_only=True)
+    def find_service_details(self, browser_key: str) -> bool:
+        """Find elevation service details from registry."""
+        self.browser_key = browser_key.lower()
+        self._log(f"Scanning registry for service details of '{self.browser_key}'...", emoji="search")
 
-        exe_path_found = None
-        clsids_found = []
-        try:
-            service_reg_path = rf"SYSTEM\CurrentControlSet\Services\{service_name}"
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, service_reg_path, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
-                image_path_raw = winreg.QueryValueEx(key, "ImagePath")[0]
-                exe_path_found = os.path.normpath(os.path.expandvars(image_path_raw.split(
-                    '"')[1] if image_path_raw.startswith('"') else image_path_raw.split(' ')[0]))
-                self._log(
-                    f"{EMOJI_INFO} Service ImagePath: {exe_path_found}", indent=1)
-                self.executable_path = exe_path_found
-        except FileNotFoundError:
-            self._log(
-                f"{EMOJI_WARNING} Service registry key not found: '{service_reg_path}'", indent=1)
-        except Exception as e:
-            self._log(
-                f"{EMOJI_FAILURE} Error reading service ImagePath for '{service_name}': {e}", indent=1)
-            return False
+        # Find the actual service name
+        candidates = BROWSER_SERVICES.get(self.browser_key, [browser_key])
+        service_name = None
+        for candidate in candidates:
+            if reg_read_value(winreg.HKEY_LOCAL_MACHINE,
+                              rf"SYSTEM\CurrentControlSet\Services\{candidate}", "ImagePath"):
+                service_name = candidate
+                self._log(f"Found service: {candidate}", indent=1, verbose_only=True, emoji="info")
+                break
 
-        self._log(f"{EMOJI_SEARCH} Searching for CLSIDs linked to LocalService '{service_name}'...",
-                  indent=1, verbose_only=True)
-        for hkey_root, root_name in [(winreg.HKEY_LOCAL_MACHINE, "HKLM"), (winreg.HKEY_CURRENT_USER, "HKCU")]:
-            for appid_path_segment in [r"SOFTWARE\Classes\AppID", r"SOFTWARE\WOW6432Node\Classes\AppID"]:
-                try:
-                    with winreg.OpenKey(hkey_root, appid_path_segment, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as appid_root_key:
-                        for i in range(winreg.QueryInfoKey(appid_root_key)[0]):
-                            try:
-                                appid_name = winreg.EnumKey(appid_root_key, i)
-                                with winreg.OpenKey(appid_root_key, appid_name, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as appid_entry_key:
-                                    try:
-                                        if winreg.QueryValueEx(appid_entry_key, "LocalService")[0].lower() == service_name.lower():
-                                            if appid_name.startswith("{") and appid_name not in clsids_found:
-                                                clsids_found.append(appid_name)
-                                                self._log(
-                                                    f"{EMOJI_INFO} Found matching CLSID '{appid_name}' via AppID '{appid_path_segment}'", indent=2, verbose_only=True)
-                                    except FileNotFoundError:
-                                        pass
-                                    except Exception as e_val:
-                                        self._log(
-                                            f"{EMOJI_WARNING} Error reading LocalService for AppID '{appid_name}': {e_val}", indent=3, verbose_only=True)
-                            except OSError:
-                                break
-                except FileNotFoundError:
-                    self._log(
-                        f"{EMOJI_INFO} Registry path not found: {root_name}\\{appid_path_segment}", indent=2, verbose_only=True)
+        if not service_name:
+            service_name = candidates[0] if candidates else browser_key
+            self._log(f"No installed service found, trying: {service_name}", indent=1, verbose_only=True, emoji="warning")
 
-        if clsids_found:
-            self.discovered_clsid = clsids_found[0]
-            self._log(
-                f"{EMOJI_SUCCESS} Discovered CLSID: {self.discovered_clsid}", indent=1)
-            if len(clsids_found) > 1:
-                self._log(
-                    f"{EMOJI_WARNING} Multiple CLSIDs found ({', '.join(clsids_found)}), using the first one.", indent=2)
-        else:
-            self._log(
-                f"{EMOJI_WARNING} Could not discover CLSID for service '{service_name}' via AppID LocalService linkage.", indent=1)
-            self._log(f"{EMOJI_SEARCH} Attempting fallback CLSID discovery via HKCR\\CLSID for executable '{self.executable_path}'...",
-                      indent=2, verbose_only=True)
-            try:
-                with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "CLSID", 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as clsid_root:
-                    for i in range(winreg.QueryInfoKey(clsid_root)[0]):
-                        try:
-                            clsid_val = winreg.EnumKey(clsid_root, i)
-                            with winreg.OpenKey(clsid_root, clsid_val + r"\LocalServer32", 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as server_key:
-                                server_path_raw, _ = winreg.QueryValueEx(
-                                    server_key, None)
-                                server_exe = os.path.normpath(server_path_raw.split(
-                                    '"')[1] if server_path_raw.startswith('"') else server_path_raw.split(' ')[0])
-                                if server_exe.lower() == self.executable_path.lower():
-                                    self.discovered_clsid = clsid_val
-                                    self._log(
-                                        f"{EMOJI_SUCCESS} Discovered CLSID '{clsid_val}' via HKCR\\CLSID\\...\\LocalServer32 match.", indent=1)
-                                    break
-                        except FileNotFoundError:
-                            pass
-                        except OSError:
-                            break
-                    if not self.discovered_clsid:
-                        self._log(
-                            f"{EMOJI_WARNING} HKCR CLSID scan did not yield a CLSID for the executable.", indent=2, verbose_only=True)
-            except FileNotFoundError:
-                self._log(
-                    f"{EMOJI_INFO} HKCR\\CLSID not found (unusual).", indent=2, verbose_only=True)
+        # Get executable path
+        image_path = reg_read_value(winreg.HKEY_LOCAL_MACHINE,
+                                    rf"SYSTEM\CurrentControlSet\Services\{service_name}", "ImagePath")
+        if image_path:
+            self.executable_path = os.path.normpath(os.path.expandvars(clean_executable_path(image_path)))
+            self._log(f"Service ImagePath: {self.executable_path}", indent=1, emoji="info")
+
+        # Find CLSID via AppID LocalService
+        self._find_clsid_for_service(service_name)
 
         if not self.executable_path:
-            self._log(
-                f"{EMOJI_FAILURE} Failed to determine executable path for '{browser_name_key}'. Cannot proceed.", indent=1)
+            self._log(f"Failed to determine executable path for '{browser_key}'", indent=1, emoji="failure")
             return False
         return True
 
-    def _original_check_method_signature(self, method_name, func_desc, type_info_context):
+    def _find_clsid_for_service(self, service_name: str):
+        """Find CLSID linked to a service via AppID."""
+        self._log(f"Searching for CLSIDs linked to '{service_name}'...", indent=1, verbose_only=True, emoji="search")
+
+        # Search AppID paths for LocalService match
+        search_paths = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Classes\AppID"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Classes\AppID"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Classes\AppID"),
+        ]
+
+        for hkey, path in search_paths:
+            for appid in reg_enum_subkeys(hkey, path):
+                if not appid.startswith("{"):
+                    continue
+                local_svc = reg_read_value(hkey, rf"{path}\{appid}", "LocalService")
+                if local_svc and local_svc.lower() == service_name.lower():
+                    self.discovered_clsid = appid
+                    self._log(f"Discovered CLSID: {self.discovered_clsid}", indent=1, emoji="success")
+                    return
+
+        # Fallback: search CLSID LocalServer32 for matching executable
+        if self.executable_path:
+            self._log("Fallback: searching CLSID LocalServer32...", indent=2, verbose_only=True)
+            clsid_paths = [
+                (winreg.HKEY_CLASSES_ROOT, "CLSID"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Classes\CLSID"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Classes\CLSID"),
+            ]
+            for hkey, path in clsid_paths:
+                for clsid in reg_enum_subkeys(hkey, path):
+                    if not clsid.startswith("{"):
+                        continue
+                    server_path = reg_read_value(hkey, rf"{path}\{clsid}\LocalServer32", None)
+                    if server_path:
+                        exe = clean_executable_path(server_path)
+                        if exe.lower() == self.executable_path.lower():
+                            self.discovered_clsid = clsid
+                            self._log(f"Discovered CLSID via LocalServer32: {clsid}", indent=1, emoji="success")
+                            return
+
+    def discover_elevation_services(self) -> List[ElevationServiceInfo]:
+        """Auto-discover all elevation services on the system."""
+        self._log("Discovering all elevation services...", indent=1, emoji="search")
+        services = []
+
+        for svc_name in reg_enum_subkeys(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services"):
+            if "elevationservice" not in svc_name.lower():
+                continue
+
+            svc_path = rf"SYSTEM\CurrentControlSet\Services\{svc_name}"
+            info = ElevationServiceInfo(service_name=svc_name)
+
+            # Infer browser vendor
+            name_lower = svc_name.lower()
+            if "googlechrome" in name_lower:
+                info.browser_vendor = "Chrome"
+            elif "microsoftedge" in name_lower:
+                info.browser_vendor = "Edge"
+            elif "brave" in name_lower:
+                info.browser_vendor = "Brave"
+            elif "vivaldi" in name_lower:
+                info.browser_vendor = "Vivaldi"
+            elif "opera" in name_lower:
+                info.browser_vendor = "Opera"
+            else:
+                info.browser_vendor = "Unknown"
+
+            # Read service properties
+            image_path = reg_read_value(winreg.HKEY_LOCAL_MACHINE, svc_path, "ImagePath")
+            if image_path:
+                info.executable_path = os.path.normpath(os.path.expandvars(clean_executable_path(image_path)))
+            info.display_name = reg_read_value(winreg.HKEY_LOCAL_MACHINE, svc_path, "DisplayName")
+            info.description = reg_read_value(winreg.HKEY_LOCAL_MACHINE, svc_path, "Description")
+            start_val = reg_read_value(winreg.HKEY_LOCAL_MACHINE, svc_path, "Start")
+            if start_val is not None:
+                info.start_type = START_TYPE_MAP.get(start_val, f"Unknown({start_val})")
+
+            # Get runtime status
+            runtime = self.get_service_runtime_status(svc_name)
+            info.status = runtime.status
+            info.pid = runtime.pid
+
+            services.append(info)
+            self._log(f"Found: {svc_name} ({info.browser_vendor})", indent=2, emoji="success")
+
+        self._log(f"Discovered {len(services)} elevation service(s)", indent=1, emoji="info")
+        return services
+
+    def get_service_runtime_status(self, service_name: str) -> ServiceRuntimeInfo:
+        """Query service runtime status via SCM."""
+        result = ServiceRuntimeInfo(service_name=service_name)
         try:
-            if method_name == "DecryptData":
-                if func_desc.cParams != 3 or func_desc.elemdescFunc.tdesc.vt != comtypes.automation.VT_HRESULT:
-                    return False
-                p0, p1, p2 = func_desc.lprgelemdescParam[
-                    0], func_desc.lprgelemdescParam[1], func_desc.lprgelemdescParam[2]
-                if not (p0.tdesc.vt == comtypes.automation.VT_BSTR and (p0._.paramdesc.wParamFlags & comtypes.typeinfo.PARAMFLAG_FIN)):
-                    return False
-                if not (((p1.tdesc.vt == (comtypes.automation.VT_BSTR | comtypes.automation.VT_BYREF)) or
-                         (p1.tdesc.vt == comtypes.automation.VT_PTR and hasattr(p1.tdesc, 'lptdesc') and p1.tdesc.lptdesc and p1.tdesc.lptdesc.contents.vt == comtypes.automation.VT_BSTR)) and
-                        (p1._.paramdesc.wParamFlags & comtypes.typeinfo.PARAMFLAG_FOUT)):
-                    return False
-                if not (((p2.tdesc.vt == (comtypes.automation.VT_UI4 | comtypes.automation.VT_BYREF)) or
-                         (p2.tdesc.vt == comtypes.automation.VT_PTR and hasattr(p2.tdesc, 'lptdesc') and p2.tdesc.lptdesc and p2.tdesc.lptdesc.contents.vt == comtypes.automation.VT_UI4)) and
-                        (p2._.paramdesc.wParamFlags & comtypes.typeinfo.PARAMFLAG_FOUT)):
-                    return False
-                return True
-            elif method_name == "EncryptData":
-                if func_desc.cParams != 4 or func_desc.elemdescFunc.tdesc.vt != comtypes.automation.VT_HRESULT:
-                    return False
-                p0, p1, p2, p3 = func_desc.lprgelemdescParam[0], func_desc.lprgelemdescParam[
-                    1], func_desc.lprgelemdescParam[2], func_desc.lprgelemdescParam[3]
-                is_p0_ok = (p0.tdesc.vt == comtypes.automation.VT_USERDEFINED) or (
-                    p0.tdesc.vt == comtypes.automation.VT_I4) or (p0.tdesc.vt == comtypes.automation.VT_INT)
-                if not (is_p0_ok and (p0._.paramdesc.wParamFlags & comtypes.typeinfo.PARAMFLAG_FIN)):
-                    return False
-                if not (p1.tdesc.vt == comtypes.automation.VT_BSTR and (p1._.paramdesc.wParamFlags & comtypes.typeinfo.PARAMFLAG_FIN)):
-                    return False
-                if not (((p2.tdesc.vt == (comtypes.automation.VT_BSTR | comtypes.automation.VT_BYREF)) or
-                         (p2.tdesc.vt == comtypes.automation.VT_PTR and hasattr(p2.tdesc, 'lptdesc') and p2.tdesc.lptdesc and p2.tdesc.lptdesc.contents.vt == comtypes.automation.VT_BSTR)) and
-                        (p2._.paramdesc.wParamFlags & comtypes.typeinfo.PARAMFLAG_FOUT)):
-                    return False
-                if not (((p3.tdesc.vt == (comtypes.automation.VT_UI4 | comtypes.automation.VT_BYREF)) or
-                         (p3.tdesc.vt == comtypes.automation.VT_PTR and hasattr(p3.tdesc, 'lptdesc') and p3.tdesc.lptdesc and p3.tdesc.lptdesc.contents.vt == comtypes.automation.VT_UI4)) and
-                        (p3._.paramdesc.wParamFlags & comtypes.typeinfo.PARAMFLAG_FOUT)):
-                    return False
-                return True
-        except Exception as e:
-            self._log(f"{EMOJI_WARNING} Exception during original signature check for '{method_name}': {e}",
-                      indent=5, verbose_only=True)
-            return False
-        return False
+            advapi32 = ctypes.windll.advapi32
+            SC_MANAGER_CONNECT = 0x0001
+            SERVICE_QUERY_STATUS = 0x0004
 
-    def check_method_signature(self, method_name: str, func_desc, type_info_context) -> bool:
-        self._log(
-            f"Performing signature check for '{method_name}'...", indent=5, verbose_only=True)
-        self._log(
-            f"Expected param count: {self.expected_param_counts.get(method_name, 'N/A')}, Actual: {func_desc.cParams}", indent=6, verbose_only=True)
-        self._log(
-            f"Return type VT: {func_desc.elemdescFunc.tdesc.vt} ({get_vt_name(func_desc.elemdescFunc.tdesc.vt, type_info_context, func_desc.elemdescFunc.tdesc)})", indent=6, verbose_only=True)
-        for i in range(func_desc.cParams):
-            p_tdesc = func_desc.lprgelemdescParam[i].tdesc
-            p_flags = func_desc.lprgelemdescParam[i]._.paramdesc.wParamFlags
-            arg_for_recursive_call = p_tdesc.hreftype if p_tdesc.vt == comtypes.automation.VT_USERDEFINED else p_tdesc
-            param_type_name_for_log = get_vt_name(
-                p_tdesc.vt, type_info_context, arg_for_recursive_call)
-            self._log(
-                f"Param {i}: Type='{param_type_name_for_log}', Raw VT=0x{p_tdesc.vt:X}, Flags=0x{p_flags:X} ({get_param_flags_string(p_flags)})", indent=6, verbose_only=True)
+            scm = advapi32.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+            if not scm:
+                result.error = f"OpenSCManager failed: {ctypes.GetLastError()}"
+                return result
 
-        check_result = self._original_check_method_signature(
-            method_name, func_desc, type_info_context)
-        self._log(f"Signature check result for '{method_name}': {check_result}", indent=5,
-                  verbose_only=True, status_emoji=EMOJI_SUCCESS if check_result else EMOJI_FAILURE)
-        return check_result
-
-    def get_inheritance_chain(self, interface_type_info_to_trace: comtypes.typeinfo.ITypeInfo) -> List[InterfaceInfo]:
-        chain: List[InterfaceInfo] = []
-        current_ti_obj: Optional[comtypes.typeinfo.ITypeInfo] = interface_type_info_to_trace
-        visited_iids = set()
-
-        initial_iface_name_for_log = "UnknownInterface"
-        try:
-            initial_iface_name_for_log, _, _, _ = interface_type_info_to_trace.GetDocumentation(
-                -1)
-        except Exception:
-            pass
-        self._log(
-            f"Tracing inheritance for '{initial_iface_name_for_log}'", indent=3, verbose_only=True)
-
-        while current_ti_obj:
-            current_attr_ptr = None
             try:
-                current_attr_ptr = current_ti_obj.GetTypeAttr()
-                if not current_attr_ptr:
-                    self._log(
-                        f"{EMOJI_WARNING} GetTypeAttr returned NULL for an ITypeInfo in chain. Stopping trace here.", indent=4, verbose_only=True)
-                    break
-
-                current_attrs = current_attr_ptr
-
-                iid_str = str(current_attrs.guid)
-                if iid_str in visited_iids:
-                    self._log(
-                        f"{EMOJI_WARNING} Loop detected in inheritance chain at IID: {iid_str}. Stopping trace.", indent=4, verbose_only=True)
-                    break
-                visited_iids.add(iid_str)
-
-                name, _, _, _ = current_ti_obj.GetDocumentation(-1)
-                self._log(
-                    f"Processing interface in chain: '{name}' (IID: {iid_str}), cFuncs: {current_attrs.cFuncs}", indent=4, verbose_only=True)
-
-                methods_defined = []
-                for i_method_idx in range(current_attrs.cFuncs):
-                    func_desc_ptr = None
-                    try:
-                        func_desc_ptr = current_ti_obj.GetFuncDesc(
-                            i_method_idx)
-                        if not func_desc_ptr:
-                            self._log(
-                                f"{EMOJI_WARNING} GetFuncDesc returned NULL for method index {i_method_idx} in '{name}'. Skipping method.", indent=5, verbose_only=True)
-                            continue
-
-                        current_func_attrs = func_desc_ptr
-
-                        m_names = current_ti_obj.GetNames(
-                            current_func_attrs.memid, current_func_attrs.cParams + 1)
-                        m_name = m_names[
-                            0] if m_names else f"UnknownMethod_memid_{current_func_attrs.memid}"
-
-                        params_list = []
-                        if current_func_attrs.cParams > 0 and current_func_attrs.lprgelemdescParam:
-                            for j in range(current_func_attrs.cParams):
-                                try:
-                                    param_elem_desc = current_func_attrs.lprgelemdescParam[j]
-                                    param_tdesc = param_elem_desc.tdesc
-                                    p_name = m_names[j+1] if len(
-                                        m_names) > (j+1) else f"param{j}"
-                                    p_type_arg = param_tdesc.hreftype if param_tdesc.vt == comtypes.automation.VT_USERDEFINED else param_tdesc
-                                    params_list.append(
-                                        f"{get_vt_name(param_tdesc.vt, current_ti_obj, p_type_arg)} {p_name}")
-                                except Exception as e_param_detail:
-                                    self._log(
-                                        f"{EMOJI_WARNING} Err param detail for '{m_name}', idx {j}: {e_param_detail}", indent=6, verbose_only=True)
-                                    params_list.append(
-                                        f"UNKNOWN_PARAM_TYPE param{j}")
-                        elif current_func_attrs.cParams > 0:
-                            self._log(
-                                f"{EMOJI_WARNING} Method '{m_name}' in '{name}' cParams={current_func_attrs.cParams} but lprgelemdescParam is NULL.", indent=5, verbose_only=True)
-                            for _ in range(current_func_attrs.cParams):
-                                params_list.append(
-                                    f"UNKNOWN_PARAM_TYPE paramN")
-
-                        ret_tdesc_obj = current_func_attrs.elemdescFunc.tdesc
-                        ret_type_arg = ret_tdesc_obj.hreftype if ret_tdesc_obj.vt == comtypes.automation.VT_USERDEFINED else ret_tdesc_obj
-                        methods_defined.append(MethodDetail(m_name, get_vt_name(
-                            ret_tdesc_obj.vt, current_ti_obj, ret_type_arg), params_list, current_func_attrs.oVft, current_func_attrs.memid, i_method_idx))
-
-                    except comtypes.COMError as e_getfuncdesc:
-                        hresult = getattr(e_getfuncdesc, 'hresult', 0)
-                        if hresult == -2147319765:
-                            self._log(
-                                f"{EMOJI_WARNING} GetFuncDesc failed (ELEMENTNOTFOUND) for method index {i_method_idx} in '{name}'. Skipping.", indent=5, verbose_only=True)
-                        else:
-                            self._log(
-                                f"{EMOJI_WARNING} COMError getting FuncDesc for method index {i_method_idx} in '{name}': {e_getfuncdesc}", indent=5, verbose_only=True)
-                        continue
-                    except Exception as e_gen_funcdesc:
-                        self._log(
-                            f"{EMOJI_WARNING} Generic error processing method index {i_method_idx} in '{name}': {e_gen_funcdesc}", indent=5, verbose_only=True)
-                        continue
-                    finally:
-                        if func_desc_ptr and current_ti_obj:
-                            try:
-                                current_ti_obj.ReleaseFuncDesc(func_desc_ptr)
-                            except:
-                                pass
-
-                base_name = "IUnknown"
-                next_base_ti_obj_for_doc = None
-                if current_attrs.cImplTypes > 0:
-                    try:
-                        next_base_ti_obj_for_doc = current_ti_obj.GetRefTypeInfo(
-                            current_ti_obj.GetRefTypeOfImplType(0))
-                        if next_base_ti_obj_for_doc:
-                            base_name, _, _, _ = next_base_ti_obj_for_doc.GetDocumentation(
-                                -1)
-                    except:
-                        self._log(
-                            f"{EMOJI_WARNING} Could not get base name for '{name}'. Default IUnknown.", indent=5, verbose_only=True)
-
-                chain.append(InterfaceInfo(name, iid_str, current_ti_obj,
-                             current_attr_ptr, methods_defined, base_name))
-
-                if name == "IUnknown" or current_attrs.cImplTypes == 0:
-                    break
+                svc = advapi32.OpenServiceW(scm, service_name, SERVICE_QUERY_STATUS)
+                if not svc:
+                    result.error = f"OpenService failed: {ctypes.GetLastError()}"
+                    return result
 
                 try:
-                    next_ti_candidate = current_ti_obj.GetRefTypeInfo(
-                        current_ti_obj.GetRefTypeOfImplType(0))
-                    current_ti_obj = next_ti_candidate
-                    current_attr_ptr = None
-                except comtypes.COMError:
-                    self._log(
-                        f"{EMOJI_WARNING} Could not get base ITypeInfo for '{name}'. Stopping trace.", indent=4, verbose_only=True)
+                    class SERVICE_STATUS_PROCESS(ctypes.Structure):
+                        _fields_ = [
+                            ("dwServiceType", ctypes.c_ulong),
+                            ("dwCurrentState", ctypes.c_ulong),
+                            ("dwControlsAccepted", ctypes.c_ulong),
+                            ("dwWin32ExitCode", ctypes.c_ulong),
+                            ("dwServiceSpecificExitCode", ctypes.c_ulong),
+                            ("dwCheckPoint", ctypes.c_ulong),
+                            ("dwWaitHint", ctypes.c_ulong),
+                            ("dwProcessId", ctypes.c_ulong),
+                            ("dwServiceFlags", ctypes.c_ulong),
+                        ]
+
+                    status = SERVICE_STATUS_PROCESS()
+                    needed = ctypes.c_ulong()
+                    if advapi32.QueryServiceStatusEx(svc, 0, ctypes.byref(status),
+                                                      ctypes.sizeof(status), ctypes.byref(needed)):
+                        state_map = {1: "stopped", 2: "start_pending", 3: "stop_pending",
+                                     4: "running", 5: "continue_pending", 6: "pause_pending", 7: "paused"}
+                        result.status = state_map.get(status.dwCurrentState, "unknown")
+                        result.pid = status.dwProcessId if status.dwProcessId else None
+                        result.can_stop = bool(status.dwControlsAccepted & 0x1)
+                        result.can_pause = bool(status.dwControlsAccepted & 0x2)
+                finally:
+                    advapi32.CloseServiceHandle(svc)
+            finally:
+                advapi32.CloseServiceHandle(scm)
+        except Exception as e:
+            result.error = str(e)
+
+        # Get start type from registry
+        start_val = reg_read_value(winreg.HKEY_LOCAL_MACHINE,
+                                   rf"SYSTEM\CurrentControlSet\Services\{service_name}", "Start")
+        if start_val is not None:
+            result.start_type = START_TYPE_MAP.get(start_val, f"unknown({start_val})").lower()
+
+        # Get dependencies
+        deps = reg_read_value(winreg.HKEY_LOCAL_MACHINE,
+                              rf"SYSTEM\CurrentControlSet\Services\{service_name}", "DependOnService")
+        if deps:
+            result.dependencies = list(deps) if isinstance(deps, (list, tuple)) else [deps]
+
+        return result
+
+    # -------------------------------------------------------------------------
+    # TypeLib Search
+    # -------------------------------------------------------------------------
+
+    def search_typelibs_by_pattern(self, pattern: str) -> List[TypeLibRegistryInfo]:
+        """Search for TypeLibs in registry matching a pattern."""
+        self._log(f"Searching TypeLibs matching '{pattern}'...", indent=1, emoji="search")
+        results = []
+        pattern_lower = pattern.lower()
+
+        for tl_id in reg_enum_subkeys(winreg.HKEY_CLASSES_ROOT, "TypeLib"):
+            if not tl_id.startswith("{"):
+                continue
+
+            for version in reg_enum_subkeys(winreg.HKEY_CLASSES_ROOT, rf"TypeLib\{tl_id}"):
+                name = reg_read_value(winreg.HKEY_CLASSES_ROOT, rf"TypeLib\{tl_id}\{version}", None)
+                if not name or pattern_lower not in name.lower():
+                    continue
+
+                info = TypeLibRegistryInfo(typelib_id=tl_id, name=name, version=version)
+                info.helpdir = reg_read_value(winreg.HKEY_CLASSES_ROOT,
+                                              rf"TypeLib\{tl_id}\{version}", "HELPDIR")
+
+                # Find paths
+                for lcid in reg_enum_subkeys(winreg.HKEY_CLASSES_ROOT, rf"TypeLib\{tl_id}\{version}"):
+                    if not lcid.isdigit():
+                        continue
+                    info.lcid = lcid
+                    info.win32_path = reg_read_value(winreg.HKEY_CLASSES_ROOT,
+                                                     rf"TypeLib\{tl_id}\{version}\{lcid}\win32", None)
+                    info.win64_path = reg_read_value(winreg.HKEY_CLASSES_ROOT,
+                                                     rf"TypeLib\{tl_id}\{version}\{lcid}\win64", None)
                     break
 
-            finally:
-                if current_attr_ptr and current_ti_obj:
+                results.append(info)
+                self._log(f"Found: {name} ({tl_id} v{version})", indent=2, verbose_only=True, emoji="success")
+
+        self._log(f"Found {len(results)} matching TypeLib(s)", indent=1, emoji="info")
+        return results
+
+    # -------------------------------------------------------------------------
+    # COM Analysis
+    # -------------------------------------------------------------------------
+
+    def analyze_com_security(self, clsid: str) -> ComSecurityInfo:
+        """Analyze COM security settings for a CLSID."""
+        if clsid in self.security_cache:
+            return self.security_cache[clsid]
+
+        result = ComSecurityInfo(clsid=clsid)
+        result.appid = reg_read_value(winreg.HKEY_CLASSES_ROOT, rf"CLSID\{clsid}", "AppID")
+
+        if result.appid:
+            appid_path = rf"AppID\{result.appid}"
+            result.runas = reg_read_value(winreg.HKEY_CLASSES_ROOT, appid_path, "RunAs")
+            result.dll_surrogate = reg_read_value(winreg.HKEY_CLASSES_ROOT, appid_path, "DllSurrogate")
+            result.local_service = reg_read_value(winreg.HKEY_CLASSES_ROOT, appid_path, "LocalService")
+
+            # Read security descriptors
+            try:
+                access = winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+                with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, appid_path, 0, access) as key:
                     try:
-                        current_ti_obj.ReleaseTypeAttr(current_attr_ptr)
-                    except:
+                        perm = winreg.QueryValueEx(key, "LaunchPermission")[0]
+                        result.has_launch_permission = True
+                        result.launch_permission_size = len(perm)
+                        result.launch_permission_sddl = decode_sddl(perm)
+                    except FileNotFoundError:
                         pass
+                    try:
+                        perm = winreg.QueryValueEx(key, "AccessPermission")[0]
+                        result.has_access_permission = True
+                        result.access_permission_size = len(perm)
+                        result.access_permission_sddl = decode_sddl(perm)
+                    except FileNotFoundError:
+                        pass
+            except (FileNotFoundError, OSError):
+                pass
+
+        self.security_cache[clsid] = result
+        return result
+
+    def analyze_proxy_stub(self, iid: str) -> ProxyStubInfo:
+        """Analyze proxy/stub registration for an interface."""
+        if iid in self.proxy_stub_cache:
+            return self.proxy_stub_cache[iid]
+
+        result = ProxyStubInfo(iid=iid)
+        iface_path = rf"Interface\{iid}"
+
+        result.name = reg_read_value(winreg.HKEY_CLASSES_ROOT, iface_path, None)
+        result.proxy_stub_clsid = reg_read_value(winreg.HKEY_CLASSES_ROOT,
+                                                  rf"{iface_path}\ProxyStubClsid32", None)
+
+        if result.proxy_stub_clsid:
+            result.marshaling_type = "custom"
+            ps_path = rf"CLSID\{result.proxy_stub_clsid}\InprocServer32"
+            result.proxy_stub_dll = reg_read_value(winreg.HKEY_CLASSES_ROOT, ps_path, None)
+            if result.proxy_stub_dll and "oleaut32" in result.proxy_stub_dll.lower():
+                result.marshaling_type = "oleautomation"
+        else:
+            # Check for TypeLib marshaling
+            result.typelib_id = reg_read_value(winreg.HKEY_CLASSES_ROOT, rf"{iface_path}\TypeLib", None)
+            if result.typelib_id:
+                result.marshaling_type = "oleautomation"
+                result.typelib_version = reg_read_value(winreg.HKEY_CLASSES_ROOT,
+                                                        rf"{iface_path}\TypeLib", "Version")
+            else:
+                result.registered = False
+                result.marshaling_type = "not registered"
+
+        self.proxy_stub_cache[iid] = result
+        return result
+
+    def analyze_pe_typelib(self) -> PeTypelibInfo:
+        """Analyze PE file for TypeLib resources."""
+        result = PeTypelibInfo()
+        if not pefile or not self.executable_path:
+            return result
+
+        try:
+            pe = pefile.PE(self.executable_path, fast_load=True)
+            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE'],
+                                                    pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
+
+            # Machine type
+            machine_map = {0x8664: ("AMD64", "x64"), 0x14c: ("I386", "x86"),
+                           0xaa64: ("ARM64", "ARM64"), 0x1c0: ("ARM", "ARM")}
+            if pe.FILE_HEADER.Machine in machine_map:
+                result.machine, result.machine_name = machine_map[pe.FILE_HEADER.Machine]
+            else:
+                result.machine = f"0x{pe.FILE_HEADER.Machine:04X}"
+                result.machine_name = "Unknown"
+
+            # Timestamp
+            ts = pe.FILE_HEADER.TimeDateStamp
+            result.timestamp = datetime.fromtimestamp(ts).isoformat() if ts else None
+
+            # Check for TypeLib resource (RT_TYPELIB = 16)
+            if hasattr(pe, 'DIRECTORY_ENTRY_RESOURCE'):
+                for entry in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+                    if entry.id == 16:
+                        result.has_embedded_typelib = True
+                        if hasattr(entry, 'directory'):
+                            result.typelib_count = len(entry.directory.entries)
+                        break
+
+            # Check imports and detect hardening APIs
+            # These APIs indicate how the service validates callers (path validation, signature checks)
+            HARDENING_APIS = {
+                "wintrust.dll": {
+                    "WinVerifyTrust": "Code signature verification",
+                    "WinVerifyTrustEx": "Extended signature verification",
+                },
+                "crypt32.dll": {
+                    "CertGetCertificateChain": "Certificate chain validation",
+                    "CertVerifyCertificateChainPolicy": "Certificate policy verification",
+                    "CryptQueryObject": "Cryptographic object query",
+                },
+                "kernel32.dll": {
+                    "GetModuleFileNameW": "Path retrieval (self)",
+                    "GetModuleFileNameA": "Path retrieval (self)",
+                    "K32GetModuleFileNameExW": "Path retrieval (external process)",
+                    "K32GetModuleFileNameExA": "Path retrieval (external process)",
+                    "GetProcessImageFileNameW": "Process image path",
+                    "QueryFullProcessImageNameW": "Full process image path",
+                    "QueryFullProcessImageNameA": "Full process image path",
+                },
+                "psapi.dll": {
+                    "GetModuleFileNameExW": "Module path (external process)",
+                    "GetModuleFileNameExA": "Module path (external process)",
+                    "GetProcessImageFileNameW": "Process image path",
+                    "GetProcessImageFileNameA": "Process image path",
+                },
+                "ntdll.dll": {
+                    "NtQueryInformationProcess": "Process information query",
+                    "ZwQueryInformationProcess": "Process information query (Zw)",
+                },
+                "advapi32.dll": {
+                    "GetTokenInformation": "Token/privilege inspection",
+                    "OpenProcessToken": "Process token access",
+                    "CheckTokenMembership": "Token group membership check",
+                },
+            }
+
+            if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+                for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                    dll = entry.dll.decode('utf-8', errors='ignore').lower()
+                    result.imports.append(dll)
+                    if 'rpcrt4' in dll:
+                        result.uses_rpc = True
+                    if 'ole32' in dll or 'oleaut32' in dll:
+                        result.uses_ole = True
+
+                    # Check for hardening APIs
+                    if dll in HARDENING_APIS:
+                        for imp in entry.imports:
+                            if not imp.name:
+                                continue
+                            func_name = imp.name.decode('utf-8', errors='ignore')
+                            if func_name in HARDENING_APIS[dll]:
+                                desc = HARDENING_APIS[dll][func_name]
+                                result.hardening_apis.append(f"{dll}!{func_name} ({desc})")
+
+            pe.close()
+        except Exception as e:
+            result.pe_error = str(e)
+
+        self.pe_info = result
+        return result
+
+    def analyze_coclasses(self) -> List[CoclassInfo]:
+        """Enumerate TKIND_COCLASS entries from TypeLib."""
+        if not self.type_lib:
+            return []
+
+        self._log("Analyzing TKIND_COCLASS entries...", indent=1, emoji="gear")
+        self.coclasses = []
+
+        for i in range(self.type_lib.GetTypeInfoCount()):
+            try:
+                ti = self.type_lib.GetTypeInfo(i)
+                attr = ti.GetTypeAttr()
+
+                if attr.typekind != comtypes.typeinfo.TKIND_COCLASS:
+                    ti.ReleaseTypeAttr(attr)
+                    continue
+
+                name, _, _, _ = ti.GetDocumentation(-1)
+                clsid = str(attr.guid)
+
+                coclass = CoclassInfo(name=name, clsid=clsid)
+
+                # Get server info from registry
+                for subkey in ["LocalServer32", "InprocServer32"]:
+                    server_path = reg_read_value(winreg.HKEY_CLASSES_ROOT, rf"CLSID\{clsid}\{subkey}", None)
+                    if server_path:
+                        coclass.server_type = subkey
+                        coclass.server_path = clean_executable_path(server_path)
+                        coclass.threading_model = reg_read_value(
+                            winreg.HKEY_CLASSES_ROOT, rf"CLSID\{clsid}\{subkey}", "ThreadingModel")
+                        break
+
+                # Enumerate implemented interfaces
+                for j in range(attr.cImplTypes):
+                    try:
+                        impl_flags = ti.GetImplTypeFlags(j)
+                        ref_type = ti.GetRefTypeOfImplType(j)
+                        impl_ti = ti.GetRefTypeInfo(ref_type)
+                        impl_name, _, _, _ = impl_ti.GetDocumentation(-1)
+                        impl_attr = impl_ti.GetTypeAttr()
+
+                        coclass.implemented_interfaces.append({
+                            "name": impl_name,
+                            "iid": str(impl_attr.guid),
+                            "is_default": bool(impl_flags & 0x1),
+                            "is_source": bool(impl_flags & 0x2),
+                        })
+                        impl_ti.ReleaseTypeAttr(impl_attr)
+                    except comtypes.COMError:
+                        pass
+
+                self.coclasses.append(coclass)
+                ti.ReleaseTypeAttr(attr)
+
+            except comtypes.COMError:
+                pass
+
+        self._log(f"Found {len(self.coclasses)} coclass(es)", indent=1, emoji="info")
+        return self.coclasses
+
+    # -------------------------------------------------------------------------
+    # TypeLib Loading and Interface Analysis
+    # -------------------------------------------------------------------------
+
+    def load_type_library(self) -> bool:
+        """Load type library from executable."""
+        if not self.executable_path:
+            self._log("No executable path specified", emoji="failure")
+            return False
+
+        self._log(f"Attempting to load type library from: {self.executable_path}", emoji="search")
+        try:
+            self.type_lib = comtypes.typeinfo.LoadTypeLibEx(self.executable_path)
+            name, _, _, _ = self.type_lib.GetDocumentation(-1)
+            self._log(f"Successfully loaded type library: '{name}'", emoji="success")
+            return True
+        except comtypes.COMError as e:
+            self._log(f"Failed to load type library: {e}", emoji="failure")
+            return False
+
+    def get_inheritance_chain(self, ti: comtypes.typeinfo.ITypeInfo) -> List[InterfaceInfo]:
+        """Build inheritance chain for an interface."""
+        chain = []
+        visited = set()
+
+        def trace(type_info):
+            try:
+                attr = type_info.GetTypeAttr()
+                iid = str(attr.guid)
+
+                if iid in visited:
+                    type_info.ReleaseTypeAttr(attr)
+                    return
+                visited.add(iid)
+
+                name, _, _, _ = type_info.GetDocumentation(-1)
+
+                # Get base interface
+                base_name = "IUnknown"
+                if attr.cImplTypes > 0:
+                    try:
+                        ref = type_info.GetRefTypeOfImplType(0)
+                        base_ti = type_info.GetRefTypeInfo(ref)
+                        base_name, _, _, _ = base_ti.GetDocumentation(-1)
+                        trace(base_ti)
+                    except comtypes.COMError:
+                        pass
+
+                # Parse methods
+                methods = []
+                for i in range(attr.cFuncs):
+                    try:
+                        fd = type_info.GetFuncDesc(i)
+                        names = type_info.GetNames(fd.memid, fd.cParams + 1)
+                        method_name = names[0] if names else f"Method{i}"
+
+                        # Build parameter list with direction flags and deep type resolution
+                        params = []
+                        for p in range(fd.cParams):
+                            pname = names[p + 1] if len(names) > p + 1 else f"p{p}"
+                            tdesc = fd.lprgelemdescParam[p].tdesc
+                            pflags = fd.lprgelemdescParam[p]._.paramdesc.wParamFlags
+                            # Use deep type resolution to expand structs/enums
+                            ptype = resolve_type_deep(type_info, tdesc)
+                            flags_str = get_param_flags_string(pflags)
+                            if flags_str:
+                                params.append(f"[{flags_str}] {ptype} {pname}")
+                            else:
+                                params.append(f"{ptype} {pname}")
+
+                        ret_tdesc = fd.elemdescFunc.tdesc
+                        ret_type = resolve_type_deep(type_info, ret_tdesc)
+
+                        methods.append(MethodDetail(
+                            name=method_name, ret_type=ret_type, params=params,
+                            ovft=fd.oVft, memid=fd.memid, index_in_interface=i
+                        ))
+                        type_info.ReleaseFuncDesc(fd)
+                    except comtypes.COMError:
+                        pass
+
+                chain.append(InterfaceInfo(
+                    name=name, iid=iid, type_info_obj=type_info, type_attr_obj=attr,
+                    methods_defined=methods, base_interface_name=base_name
+                ))
+
+            except comtypes.COMError:
+                pass
+
+        trace(ti)
         return chain
 
-    def analyze_interfaces_directly(self):
+    def check_method_signature(self, method_name: str, fd, ti) -> bool:
+        """Check if a method matches expected ABE signature."""
+        expected = self.expected_params.get(method_name)
+        if expected is None:
+            return True
+
+        if fd.cParams != expected:
+            return False
+        if fd.elemdescFunc.tdesc.vt != comtypes.automation.VT_HRESULT:
+            return False
+
+        if method_name == "DecryptData" and fd.cParams == 3:
+            # BSTR in, BSTR* out, ULONG* out
+            p0 = fd.lprgelemdescParam[0]
+            if p0.tdesc.vt != comtypes.automation.VT_BSTR:
+                return False
+            if not (p0._.paramdesc.wParamFlags & comtypes.typeinfo.PARAMFLAG_FIN):
+                return False
+        elif method_name == "EncryptData" and fd.cParams == 4:
+            # First param should be in
+            p0 = fd.lprgelemdescParam[0]
+            if not (p0._.paramdesc.wParamFlags & comtypes.typeinfo.PARAMFLAG_FIN):
+                return False
+
+        return True
+
+    def analyze_interfaces(self):
+        """Analyze all interfaces in the TypeLib for ABE capability."""
         if not self.type_lib:
-            self._log(f"{EMOJI_FAILURE} Type library not loaded. Cannot analyze interfaces.",
-                      status_emoji=EMOJI_FAILURE)
             return
 
-        self._log(
-            f"{EMOJI_GEAR} Analyzing all TKIND_INTERFACE entries from TypeLib...", indent=1)
-        self.results = []
-        self.interfaces_scanned = 0
-        self.interfaces_abe_capable = 0
+        self._log("Analyzing all TKIND_INTERFACE entries from TypeLib...", indent=1, emoji="gear")
+        count = self.type_lib.GetTypeInfoCount()
+        self._log(f"Found {count} type definitions to scan", indent=1, emoji="info")
 
-        num_type_infos = 0
-        try:
-            num_type_infos = self.type_lib.GetTypeInfoCount()
-            self._log(f"{EMOJI_INFO} Found {num_type_infos} type definitions to scan", indent=1)
-        except Exception as e_count:
-            self._log(
-                f"{EMOJI_FAILURE} Error getting TypeInfo count: {e_count}", indent=2)
-            return
-
-        for i in range(num_type_infos):
-            # Progress indicator (every 10%)
-            if num_type_infos > 10 and i % max(1, num_type_infos // 10) == 0 and i > 0:
-                progress_pct = (i / num_type_infos) * 100
-                self._log(f"{EMOJI_SEARCH} Progress: {progress_pct:.0f}% ({i}/{num_type_infos} type definitions scanned)", indent=1)
-            type_info_obj_main_iter = None
-            attr_main_iter_ptr = None
-            interface_name_for_log = f"TypeInfo index {i}"
-
+        for i in range(count):
             try:
-                type_info_obj_main_iter = self.type_lib.GetTypeInfo(i)
-                attr_main_iter_ptr = type_info_obj_main_iter.GetTypeAttr()
+                ti = self.type_lib.GetTypeInfo(i)
+                attr = ti.GetTypeAttr()
 
-                try:
-                    doc_name, _, _, _ = type_info_obj_main_iter.GetDocumentation(
-                        -1)
-                    if doc_name:
-                        interface_name_for_log = doc_name
-                except Exception:
-                    pass
-
-                if not attr_main_iter_ptr or attr_main_iter_ptr.typekind != comtypes.typeinfo.TKIND_INTERFACE:
+                if attr.typekind != comtypes.typeinfo.TKIND_INTERFACE:
+                    ti.ReleaseTypeAttr(attr)
                     continue
 
                 self.interfaces_scanned += 1
-                interface_iid_str = str(attr_main_iter_ptr.guid)
-                self._log(
-                    f"Scanning Interface: '{interface_name_for_log}' (IID: {interface_iid_str})", indent=2, verbose_only=True)
+                name, _, _, _ = ti.GetDocumentation(-1)
+                iid = str(attr.guid)
 
-                current_interface_chain = self.get_inheritance_chain(
-                    type_info_obj_main_iter)
-                methods_found_in_chain = {}
+                self._log(f"Scanning Interface: '{name}' (IID: {iid})", indent=2, verbose_only=True)
 
-                for iface_in_chain_info in current_interface_chain:
-                    for method_detail in iface_in_chain_info.methods_defined:
-                        method_name = method_detail.name
-                        if method_name in self.target_method_names and method_name not in methods_found_in_chain:
-                            func_desc_ptr_check = None
-                            try:
-                                func_desc_ptr_check = iface_in_chain_info.type_info_obj.GetFuncDesc(
-                                    method_detail.index_in_interface)
-                                if func_desc_ptr_check and \
-                                   func_desc_ptr_check.cParams == self.expected_param_counts.get(method_name, -1) and \
-                                   self.check_method_signature(method_name, func_desc_ptr_check, iface_in_chain_info.type_info_obj):
-                                    methods_found_in_chain[method_name] = AnalyzedMethod(
-                                        name=method_name, ovft=func_desc_ptr_check.oVft, memid=func_desc_ptr_check.memid,
-                                        defining_interface_name=iface_in_chain_info.name,
-                                        defining_interface_iid=iface_in_chain_info.iid
-                                    )
-                                    self._log(f"'{method_name}' matched signature in '{iface_in_chain_info.name}'.",
-                                              indent=4, verbose_only=True, status_emoji=EMOJI_LIGHTBULB)
-                            except comtypes.COMError as e_fd_check:
-                                hresult_fd = getattr(e_fd_check, 'hresult', 0)
-                                if hresult_fd != -2147319765:
-                                    self._log(
-                                        f"{EMOJI_WARNING} COMError checking method '{method_name}' in '{iface_in_chain_info.name}': {e_fd_check}", indent=5, verbose_only=True)
-                            finally:
-                                if func_desc_ptr_check and iface_in_chain_info.type_info_obj:
-                                    try:
-                                        iface_in_chain_info.type_info_obj.ReleaseFuncDesc(
-                                            func_desc_ptr_check)
-                                    except:
-                                        pass
+                # Get inheritance chain and check for target methods
+                chain = self.get_inheritance_chain(ti)
+                found_methods = {}
 
-                if all(name in methods_found_in_chain for name in self.target_method_names):
+                for iface in chain:
+                    for method in iface.methods_defined:
+                        if method.name in self.target_methods:
+                            # Verify signature
+                            for j in range(iface.type_attr_obj.cFuncs):
+                                try:
+                                    fd = iface.type_info_obj.GetFuncDesc(j)
+                                    names = iface.type_info_obj.GetNames(fd.memid, 1)
+                                    if names and names[0] == method.name:
+                                        if self.check_method_signature(method.name, fd, iface.type_info_obj):
+                                            found_methods[method.name] = AnalyzedMethod(
+                                                name=method.name, ovft=method.ovft, memid=method.memid,
+                                                defining_interface_name=iface.name,
+                                                defining_interface_iid=iface.iid
+                                            )
+                                            self._log(f"'{method.name}' matched in '{iface.name}'",
+                                                      indent=4, verbose_only=True, emoji="lightbulb")
+                                    iface.type_info_obj.ReleaseFuncDesc(fd)
+                                except comtypes.COMError:
+                                    pass
+
+                # Check if all target methods found
+                if all(m in found_methods for m in self.target_methods):
                     self.interfaces_abe_capable += 1
-                    self._log(
-                        f"{EMOJI_INFO} Found ABE-capable: '{interface_name_for_log}' (IID: {interface_iid_str})", indent=3)
                     self.results.append(AbeCandidate(
-                        clsid=self.discovered_clsid or "Unknown CLSID",
-                        interface_name=interface_name_for_log,
-                        interface_iid=interface_iid_str,
-                        methods=methods_found_in_chain,
-                        inheritance_chain_info=current_interface_chain
+                        clsid=self.discovered_clsid or "Unknown",
+                        interface_name=name, interface_iid=iid,
+                        methods=found_methods, inheritance_chain_info=chain
                     ))
-                else:
-                    self._log(
-                        f"Interface '{interface_name_for_log}' did not meet all target method criteria.", indent=3, verbose_only=True)
+                    self._log(f"Found ABE-capable: '{name}' (IID: {iid})", indent=2, emoji="info")
 
-            except comtypes.COMError as e_com_loop:
-                self._log(
-                    f"{EMOJI_FAILURE} COMError processing {interface_name_for_log}: {e_com_loop}", indent=2)
-            except Exception as e_gen_loop:
-                self._log(
-                    f"{EMOJI_FAILURE} Generic error processing {interface_name_for_log}: {e_gen_loop}", indent=2)
-                if self.args_verbose:
-                    import traceback
-                    traceback.print_exc()
-            finally:
-                if attr_main_iter_ptr and type_info_obj_main_iter:
-                    try:
-                        type_info_obj_main_iter.ReleaseTypeAttr(
-                            attr_main_iter_ptr)
-                    except:
-                        pass
+                ti.ReleaseTypeAttr(attr)
 
-        if not self.results:
-            self._log(
-                f"{EMOJI_INFO} No ABE-capable interfaces were found after scanning all TypeInfo entries.", indent=1)
+            except comtypes.COMError:
+                pass
 
+    # -------------------------------------------------------------------------
+    # Main Analysis Entry Point
+    # -------------------------------------------------------------------------
 
-    def analyze(self, scan_mode=False, browser_key_for_scan=None, user_provided_clsid=None):
-        self.start_time = time.time()
+    def analyze(self, scan_mode: bool = False, browser_key: str = None, user_clsid: str = None):
+        """Main analysis entry point."""
         comtypes.CoInitialize()
-        try:
-            if scan_mode and browser_key_for_scan:
-                self._log(
-                    f"{EMOJI_GEAR} Scan mode enabled for: {browser_key_for_scan}")
-                if not self.find_details_from_registry_by_service_name(browser_key_for_scan):
-                    self._log(
-                        f"{EMOJI_FAILURE} Scan mode: Could not find critical details for '{browser_key_for_scan}'.", status_emoji=EMOJI_FAILURE)
-                    return
-                if user_provided_clsid and not self.discovered_clsid:
-                    self.discovered_clsid = user_provided_clsid
-                    self._log(
-                        f"{EMOJI_INFO} Using user-provided CLSID: {self.discovered_clsid}", indent=1)
-                elif user_provided_clsid and self.discovered_clsid and user_provided_clsid.lower() != self.discovered_clsid.lower():
-                    self._log(
-                        f"{EMOJI_WARNING} User CLSID '{user_provided_clsid}' differs from scanned '{self.discovered_clsid}'. Using user-provided.", indent=1)
-                    self.discovered_clsid = user_provided_clsid
-            elif user_provided_clsid:
-                self.discovered_clsid = user_provided_clsid
-                self._log(
-                    f"{EMOJI_INFO} Using user-provided CLSID: {self.discovered_clsid}")
+        self.start_time = time.time()
 
-            if not self.executable_path or not os.path.exists(self.executable_path):
-                self._log(
-                    f"Executable path not determined or invalid: '{self.executable_path}'.", status_emoji=EMOJI_FAILURE)
-                return
+        try:
+            if scan_mode and browser_key:
+                self._log(f"Scan mode enabled for: {browser_key}", emoji="gear")
+                if not self.find_service_details(browser_key):
+                    return
+
+            if user_clsid:
+                self.discovered_clsid = user_clsid
+
+            # PE analysis
+            if self.executable_path and pefile:
+                self._log("Analyzing PE structure...", indent=1, emoji="gear")
+                pe_info = self.analyze_pe_typelib()
+                if pe_info.machine_name:
+                    self._log(f"PE Architecture: {pe_info.machine_name}", indent=2, verbose_only=True, emoji="info")
+
+            # Load TypeLib
             if not self.load_type_library():
                 return
-            self.analyze_interfaces_directly()
+
+            # Analyze coclasses
+            self.analyze_coclasses()
+
+            # Analyze interfaces
+            self.analyze_interfaces()
+
+            # Analyze security
+            if self.discovered_clsid:
+                self._log("Analyzing COM security settings...", indent=1, emoji="gear")
+                sec = self.analyze_com_security(self.discovered_clsid)
+                if sec.local_service:
+                    self._log(f"LocalService: {sec.local_service}", indent=2, verbose_only=True, emoji="info")
+
+            # Analyze proxy/stub for results
+            if self.results:
+                self._log("Analyzing proxy/stub registration...", indent=1, emoji="gear")
+                for r in self.results:
+                    ps = self.analyze_proxy_stub(r.interface_iid)
+                    self._log(f"{r.interface_name}: {ps.marshaling_type}", indent=2, verbose_only=True, emoji="info")
+
         finally:
             comtypes.CoUninitialize()
-            
+
+    # -------------------------------------------------------------------------
+    # Output Methods
+    # -------------------------------------------------------------------------
+
+    def calculate_vtable_layout(self, chain: List[InterfaceInfo]) -> List[VtableSlotInfo]:
+        """Calculate vtable layout from inheritance chain."""
+        slots = []
+        current_slot = 0
+
+        for iface in reversed(chain):
+            for method in iface.methods_defined:
+                slots.append(VtableSlotInfo(
+                    method_name=method.name, slot_index=current_slot,
+                    offset_x64=current_slot * 8, offset_x86=current_slot * 4,
+                    defining_interface=iface.name, memid=method.memid
+                ))
+                current_slot += 1
+
+        return slots
+
     def export_to_json(self, output_file: str) -> bool:
-        """Export analysis results to JSON format."""
+        """Export analysis results to JSON."""
         if not self.results:
-            self._log(f"{EMOJI_FAILURE} No results to export to JSON.", status_emoji=EMOJI_FAILURE)
+            self._log("No results to export", emoji="failure")
             return False
-        
+
         try:
-            export_data = {
+            data = {
                 "metadata": {
                     "tool": "COMrade ABE Analyzer",
-                    "version": "1.1.0",
+                    "version": "2.0.0",
                     "timestamp": datetime.now().isoformat(),
-                    "analysis_duration_seconds": time.time() - self.start_time if self.start_time else 0,
+                    "duration_seconds": time.time() - self.start_time if self.start_time else 0,
                     "browser": self.browser_key or "unknown",
-                    "executable_path": self.executable_path or "unknown"
+                    "executable": self.executable_path or "unknown"
                 },
                 "statistics": {
-                    "total_interfaces_scanned": self.interfaces_scanned,
-                    "abe_capable_interfaces_found": self.interfaces_abe_capable,
-                    "target_methods": self.target_method_names
+                    "interfaces_scanned": self.interfaces_scanned,
+                    "abe_capable_found": self.interfaces_abe_capable,
+                    "coclasses_found": len(self.coclasses),
+                    "target_methods": self.target_methods
                 },
                 "discovered_clsid": self.discovered_clsid or "Unknown",
-                "results": []
             }
-            
-            for candidate in self.results:
-                result_entry = {
-                    "interface_name": candidate.interface_name,
-                    "interface_iid": candidate.interface_iid,
-                    "clsid": candidate.clsid,
-                    "methods": {},
-                    "inheritance_chain": []
+
+            # PE info
+            if self.pe_info:
+                data["pe_info"] = {
+                    "machine": self.pe_info.machine,
+                    "machine_name": self.pe_info.machine_name,
+                    "timestamp": self.pe_info.timestamp,
+                    "has_typelib": self.pe_info.has_embedded_typelib,
+                    "uses_rpc": self.pe_info.uses_rpc,
+                    "uses_ole": self.pe_info.uses_ole,
+                    "hardening_apis": self.pe_info.hardening_apis,
                 }
-                
-                # Add methods
-                for method_name, method_detail in candidate.methods.items():
-                    result_entry["methods"][method_name] = {
-                        "name": method_detail.name,
-                        "vtable_offset": method_detail.ovft,
-                        "memid": method_detail.memid,
-                        "defining_interface": method_detail.defining_interface_name,
-                        "defining_interface_iid": method_detail.defining_interface_iid
+
+            # Security info
+            if self.discovered_clsid:
+                sec = self.analyze_com_security(self.discovered_clsid)
+                data["security_info"] = {
+                    "appid": sec.appid,
+                    "local_service": sec.local_service,
+                    "runas": sec.runas,
+                    "launch_permission_sddl": sec.launch_permission_sddl,
+                    "access_permission_sddl": sec.access_permission_sddl,
+                }
+
+                if sec.local_service:
+                    rt = self.get_service_runtime_status(sec.local_service)
+                    data["service_runtime"] = {
+                        "status": rt.status, "pid": rt.pid,
+                        "start_type": rt.start_type, "dependencies": rt.dependencies,
                     }
-                
-                # Add inheritance chain
-                for iface_info in candidate.inheritance_chain_info:
-                    chain_entry = {
-                        "name": iface_info.name,
-                        "iid": iface_info.iid,
-                        "base_interface": iface_info.base_interface_name,
-                        "methods_count": len(iface_info.methods_defined)
-                    }
-                    result_entry["inheritance_chain"].append(chain_entry)
-                
-                export_data["results"].append(result_entry)
-            
+
+            # Results
+            data["results"] = []
+            for r in self.results:
+                vtable = self.calculate_vtable_layout(r.inheritance_chain_info)
+                ps = self.analyze_proxy_stub(r.interface_iid)
+
+                data["results"].append({
+                    "interface_name": r.interface_name,
+                    "interface_iid": r.interface_iid,
+                    "clsid": r.clsid,
+                    "methods": {name: {"vtable_offset": m.ovft, "memid": m.memid,
+                                        "defining_interface": m.defining_interface_name}
+                                for name, m in r.methods.items()},
+                    "inheritance_chain": [{"name": i.name, "iid": i.iid,
+                                           "base": i.base_interface_name,
+                                           "methods_count": len(i.methods_defined)}
+                                          for i in r.inheritance_chain_info],
+                    "proxy_stub": {"type": ps.marshaling_type, "registered": ps.registered},
+                    "vtable_slots": len(vtable),
+                })
+
             with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(export_data, f, indent=2, ensure_ascii=False)
-            
-            self._log(f"{EMOJI_SUCCESS} JSON export saved to: {output_file}")
+                json.dump(data, f, indent=2)
+            self._log(f"Exported to: {output_file}", emoji="file")
             return True
-            
+
         except Exception as e:
-            self._log(f"{EMOJI_FAILURE} Error exporting JSON: {e}", status_emoji=EMOJI_FAILURE)
+            self._log(f"Export failed: {e}", emoji="failure")
             return False
 
-    def generate_cpp_stub_for_chain(self, chain_info_list: List[InterfaceInfo], main_abe_interface_iid: str) -> str:
-        output_cpp = ""
-        processed_iids = set()
-        udt_names_generated = set()
-        all_udts_to_define = set()
+    def generate_cpp_stubs(self, chain: List[InterfaceInfo], main_iid: str) -> str:
+        """Generate C++ interface stubs."""
+        output = ""
+        processed = set()
 
-        for iface_info in chain_info_list:
-            for method_data in iface_info.methods_defined:
-                for type_str_base in [method_data.ret_type.replace("*", "").strip()] + \
-                                     [p.split(" ")[0].replace("*", "").strip() for p in method_data.params]:
-                    if type_str_base not in udt_names_generated and \
-                       not any(kw in type_str_base.lower() for kw in ["hresult", "bstr", "long", "int", "byte", "short", "void", "char", "float", "double", "currency", "date", "scode", "variant_bool", "variant", "iunknown", "idispatch", "decimal", "hyper", "uhyper", "filetime", "blob", "lpwstr", "ulong", "safearray", "lpstr"]):
-                        all_udts_to_define.add(type_str_base)
-
-        self._log(f"{EMOJI_GEAR} Generating UDT (Enum) definitions...",
-                  indent=1, verbose_only=True)
-        for udt_name in sorted(list(all_udts_to_define)):
-            if udt_name in udt_names_generated or not udt_name:
+        for iface in reversed(chain):
+            if iface.iid in processed:
                 continue
-            udt_ti = udt_attr = None
-            try:
-                for i_ti_idx in range(self.type_lib.GetTypeInfoCount()):
-                    ti, attr = self.type_lib.GetTypeInfo(
-                        i_ti_idx), self.type_lib.GetTypeInfo(i_ti_idx).GetTypeAttr()
-                    name, _, _, _ = ti.GetDocumentation(-1)
-                    if name == udt_name and attr.typekind == comtypes.typeinfo.TKIND_ENUM:
-                        udt_ti, udt_attr = ti, attr
-                        break
-                    if ti and attr:
-                        ti.ReleaseTypeAttr(attr)
+            processed.add(iface.iid)
 
-                if udt_ti and udt_attr:
-                    self._log(
-                        f"Defining enum: {udt_name}", indent=2, verbose_only=True)
-                    output_cpp += f"// Enum: {udt_name}\ntypedef enum {udt_name} {{\n"
-                    for k_enum in range(udt_attr.cVars):
-                        var_desc = udt_ti.GetVarDesc(k_enum)
-                        enum_val_name = udt_ti.GetNames(var_desc.memid, 1)[0]
-                        val = k_enum
-                        if var_desc.varkind == comtypes.typeinfo.VAR_CONST and var_desc._.lpvarValue:
-                            try:
-                                val = ctypes.cast(var_desc._.lpvarValue, ctypes.POINTER(
-                                    comtypes.automation.VARIANT)).contents.value
-                            except:
-                                self._log(
-                                    f"{EMOJI_WARNING} Could not get val for enum {enum_val_name}", indent=3, verbose_only=True)
-                        output_cpp += f"    {enum_val_name} = {val},\n"
-                        udt_ti.ReleaseVarDesc(var_desc)
-                    output_cpp += f"}} {udt_name};\n\n"
-                    udt_names_generated.add(udt_name)
+            output += f'MIDL_INTERFACE("{iface.iid}") // {format_guid_for_cpp(iface.iid)}\n'
+            output += f"{iface.name} : public {iface.base_interface_name}\n{{\npublic:\n"
+
+            if not iface.methods_defined:
+                if iface.name == "IUnknown":
+                    output += "    // Standard IUnknown methods\n"
                 else:
-                    self._log(
-                        f"{EMOJI_INFO} UDT '{udt_name}' not found as enum. Skipping.", indent=2, verbose_only=True)
-            finally:
-                if udt_attr and udt_ti:
-                    udt_ti.ReleaseTypeAttr(udt_attr)
+                    output += "    // No methods defined\n"
+            else:
+                for m in iface.methods_defined:
+                    params = ", ".join(m.params) if m.params else "void"
+                    output += f"    virtual {m.ret_type} STDMETHODCALLTYPE {m.name}({params}) = 0;\n"
 
-        self._log(f"{EMOJI_GEAR} Generating MIDL_INTERFACE definitions...",
-                  indent=1, verbose_only=True)
-        for iface_info in reversed(chain_info_list):
-            if iface_info.iid in processed_iids:
-                continue
-            self._log(
-                f"Defining interface: {iface_info.name} (IID: {iface_info.iid}) : {iface_info.base_interface_name}", indent=2, verbose_only=True)
-            output_cpp += f"MIDL_INTERFACE(\"{iface_info.iid}\") // C++ style: {format_guid_for_cpp(iface_info.iid)}\n"
-            output_cpp += f"{iface_info.name} : public {iface_info.base_interface_name}\n{{\npublic:\n"
+            output += "};\n\n"
 
-            if not iface_info.methods_defined:
-                if iface_info.name == "IUnknown":
-                    output_cpp += "    // Standard IUnknown methods.\n"
-                elif iface_info.iid == main_abe_interface_iid:
-                    output_cpp += "    // Primary ABE Interface: All methods inherited.\n"
-                elif iface_info.type_attr_obj and iface_info.type_attr_obj.cFuncs > 0:
-                    self._log(
-                        f"{EMOJI_WARNING} Interface '{iface_info.name}' cFuncs={iface_info.type_attr_obj.cFuncs}, but no methods parsed. Placeholders generated.", indent=3, verbose_only=True)
-                    for idx_m in range(iface_info.type_attr_obj.cFuncs):
-                        m_name_ph, params_ph_f, ret_type_ph = f"AbstractMethod_slot{idx_m}_in_{iface_info.name.replace(' ', '_')}", "(void)", "HRESULT"
-                        fd_ph = None
-                        try:
-                            fd_ph = iface_info.type_info_obj.GetFuncDesc(idx_m)
-                            if fd_ph:
-                                names_ph = iface_info.type_info_obj.GetNames(
-                                    fd_ph.memid, fd_ph.cParams + 1)
-                                m_name_ph = names_ph[0] if names_ph else m_name_ph
-                                params_list_ph = [f"{get_vt_name(fd_ph.lprgelemdescParam[p_idx].tdesc.vt, iface_info.type_info_obj, fd_ph.lprgelemdescParam[p_idx].tdesc.hreftype if fd_ph.lprgelemdescParam[p_idx].tdesc.vt == comtypes.automation.VT_USERDEFINED else fd_ph.lprgelemdescParam[p_idx].tdesc)} {names_ph[p_idx+1] if names_ph and len(names_ph) > p_idx+1 else f'p{p_idx}'}" for p_idx in range(
-                                    fd_ph.cParams)] if fd_ph.lprgelemdescParam else ["UNKNOWN_TYPE pN" for _ in range(fd_ph.cParams)]
-                                ret_tdesc_ph_obj = fd_ph.elemdescFunc.tdesc
-                                ret_type_ph = get_vt_name(ret_tdesc_ph_obj.vt, iface_info.type_info_obj,
-                                                          ret_tdesc_ph_obj.hreftype if ret_tdesc_ph_obj.vt == comtypes.automation.VT_USERDEFINED else ret_tdesc_ph_obj)
-                                if params_list_ph:
-                                    params_ph_f = f"(\n        {params_list_ph[0]}" + (",\n        " + ",\n        ".join(
-                                        params_list_ph[1:]) if len(params_list_ph) > 1 else "") + "\n    )"
-                        except Exception as e_ph:
-                            self._log(
-                                f"{EMOJI_WARNING} Err detail placeholder {iface_info.name} slot {idx_m}: {e_ph}", indent=4, verbose_only=True)
-                        finally:
-                            if fd_ph and iface_info.type_info_obj:
-                                iface_info.type_info_obj.ReleaseFuncDesc(fd_ph)
-                        output_cpp += f"    virtual {ret_type_ph} STDMETHODCALLTYPE {m_name_ph}{params_ph_f} = 0;\n"
-                else:
-                    output_cpp += "    // No methods directly defined (cFuncs is 0).\n"
+        return output
 
-            for md in iface_info.methods_defined:
-                params_f = f"(\n        {md.params[0]}" + (",\n        " + ",\n        ".join(
-                    md.params[1:]) if len(md.params) > 1 else "") + "\n    )" if md.params else "(void)"
-                output_cpp += f"    virtual {md.ret_type} STDMETHODCALLTYPE {md.name}{params_f} = 0;\n"
-            output_cpp += "};\n\n"
-            processed_iids.add(iface_info.iid)
-        return output_cpp
-
-    def print_results(self, output_cpp_stub_file=None):
+    def print_results(self, output_cpp_file: str = None, show_sddl: bool = False,
+                      show_service_status: bool = False):
+        """Print analysis results."""
         if not self.results:
-            self._log(f"{EMOJI_FAILURE} No ABE Interface candidates found.",
-                      status_emoji=EMOJI_FAILURE)
+            self._log("No ABE Interface candidates found.", emoji="failure")
             return
 
-        browser_name_print = (
-            self.browser_key or "unknown_browser").capitalize()
-        exe_path_print = self.executable_path or "PATH_NOT_DETERMINED"
-        common_clsid_str = self.results[0].clsid
-        common_clsid_cpp = format_guid_for_cpp(common_clsid_str)
+        browser = (self.browser_key or "unknown").capitalize()
+        exe = self.executable_path or "N/A"
+        clsid = self.results[0].clsid
 
-        print(f"\n--- {EMOJI_LIGHTBULB} Analysis Summary ---")
-        print(f"  Browser Target    : {browser_name_print}")
-        print(f"  Service Executable: {exe_path_print}")
-        print(f"  Discovered CLSID  : {common_clsid_str}")
-        if common_clsid_cpp != format_guid_for_cpp(None):
-            print(f"      (C++ Style)   : {common_clsid_cpp}")
-        
-        # Show statistics
+        print(f"\n--- {EMOJI['lightbulb']} Analysis Summary ---")
+        print(f"  Browser Target    : {browser}")
+        print(f"  Service Executable: {exe}")
+        print(f"  Discovered CLSID  : {clsid}")
+        print(f"      (C++ Style)   : {format_guid_for_cpp(clsid)}")
+
+        # Statistics
         if self.start_time:
             duration = time.time() - self.start_time
-            print(f"\n  {EMOJI_GEAR} Statistics:")
+            print(f"\n  {EMOJI['gear']} Statistics:")
             print(f"    Analysis Duration : {duration:.2f} seconds")
             print(f"    Interfaces Scanned: {self.interfaces_scanned}")
             print(f"    ABE-Capable Found : {self.interfaces_abe_capable}")
+            print(f"    Coclasses Found   : {len(self.coclasses)}")
             if self.interfaces_scanned > 0:
-                success_rate = (self.interfaces_abe_capable / self.interfaces_scanned) * 100
-                print(f"    Success Rate      : {success_rate:.1f}%")
+                print(f"    Success Rate      : {(self.interfaces_abe_capable / self.interfaces_scanned) * 100:.1f}%")
 
+        # PE info
+        if self.pe_info and not self.pe_info.pe_error:
+            print(f"\n  {EMOJI['file']} PE Information:")
+            print(f"    Architecture      : {self.pe_info.machine_name}")
+            print(f"    Build Timestamp   : {self.pe_info.timestamp}")
+            print(f"    Embedded TypeLib  : {'Yes' if self.pe_info.has_embedded_typelib else 'No'}")
+            print(f"    Uses RPC Runtime  : {'Yes' if self.pe_info.uses_rpc else 'No'}")
+            print(f"    Uses OLE/OleAut   : {'Yes' if self.pe_info.uses_ole else 'No'}")
+
+            # Show hardening APIs (security validation mechanisms)
+            if self.pe_info.hardening_apis:
+                print(f"\n  {EMOJI['warning']} Hardening APIs Detected ({len(self.pe_info.hardening_apis)}):")
+                for api in self.pe_info.hardening_apis:
+                    print(f"    - {api}")
+
+        # Security info
+        if self.discovered_clsid:
+            sec = self.analyze_com_security(self.discovered_clsid)
+            if sec.appid or sec.local_service or sec.runas:
+                print(f"\n  {EMOJI['gear']} COM Security Settings:")
+                if sec.appid:
+                    print(f"    AppID             : {sec.appid}")
+                if sec.local_service:
+                    print(f"    LocalService      : {sec.local_service}")
+                    if show_service_status:
+                        rt = self.get_service_runtime_status(sec.local_service)
+                        status_emoji = EMOJI['success'] if rt.status == "running" else EMOJI['info']
+                        pid_str = f" (PID: {rt.pid})" if rt.pid else ""
+                        print(f"    Service Status    : {status_emoji} {rt.status}{pid_str}")
+                        print(f"    Service Start Type: {rt.start_type}")
+                if sec.runas:
+                    print(f"    RunAs             : {sec.runas}")
+                if sec.has_launch_permission:
+                    print(f"    LaunchPermission  : Set ({sec.launch_permission_size} bytes)")
+                    if show_sddl and sec.launch_permission_sddl:
+                        print(f"      SDDL: {sec.launch_permission_sddl}")
+                if sec.has_access_permission:
+                    print(f"    AccessPermission  : Set ({sec.access_permission_size} bytes)")
+                    if show_sddl and sec.access_permission_sddl:
+                        print(f"      SDDL: {sec.access_permission_sddl}")
+
+        # Coclasses
+        if self.coclasses and self.verbose:
+            print(f"\n  {EMOJI['gear']} Coclasses ({len(self.coclasses)}):")
+            for cc in self.coclasses:
+                print(f"    {cc.name}: {cc.clsid}")
+
+        # Results
         print(f"\n  Found {len(self.results)} ABE-Capable Interface(s):")
-        chrome_known_good_iid = "{463ABECF-410D-407F-8AF5-0DF35A005CC8}".lower()
-        edge_known_good_iid = "{C9C2B807-7731-4F34-81B7-44FF7779522B}".lower()
-        brave_known_good_iid = "{F396861E-0C8E-4C71-8256-2FAE6D759CE9}".lower()
 
-        primary_candidate_for_stub = self.results[0]
-        if self.browser_key == "chrome":
-            for r in self.results:
-                if r.interface_iid.lower() == chrome_known_good_iid:
-                    primary_candidate_for_stub = r
-                    break
-        elif self.browser_key == "edge":
-            for r in self.results:
-                if r.interface_iid.lower() == edge_known_good_iid:
-                    primary_candidate_for_stub = r
-                    break
-        elif self.browser_key == "brave":
-            for r in self.results:
-                if r.interface_iid.lower() == brave_known_good_iid:
-                    primary_candidate_for_stub = r
-                    break
+        # Find primary candidate
+        primary_iid = KNOWN_PRIMARY_IIDS.get(self.browser_key, "").lower()
+        primary = self.results[0]
+        for r in self.results:
+            if r.interface_iid.lower() == primary_iid:
+                primary = r
+                break
 
-        for i, res_candidate in enumerate(self.results):
-            is_primary_for_tool = (res_candidate.interface_iid.lower(
-            ) == primary_candidate_for_stub.interface_iid.lower())
-            primary_marker = f" {EMOJI_LIGHTBULB} (Likely primary for tool)" if is_primary_for_tool else ""
-            print(f"\n  Candidate {i+1}:{primary_marker}")
-            print(
-                f"    Interface Name: {res_candidate.interface_name or 'Unknown'}")
-            print(
-                f"    IID           : {res_candidate.interface_iid or 'Unknown'}")
-            if format_guid_for_cpp(res_candidate.interface_iid) != format_guid_for_cpp(None):
-                print(
-                    f"      (C++ Style) : {format_guid_for_cpp(res_candidate.interface_iid)}")
+        for i, r in enumerate(self.results):
+            is_primary = r.interface_iid.lower() == primary.interface_iid.lower()
+            marker = f" {EMOJI['lightbulb']} (Likely primary for tool)" if is_primary else ""
+            print(f"\n  Candidate {i + 1}:{marker}")
+            print(f"    Interface Name: {r.interface_name}")
+            print(f"    IID           : {r.interface_iid}")
+            print(f"      (C++ Style) : {format_guid_for_cpp(r.interface_iid)}")
 
-        if self.args_verbose:
-            print(f"\n--- {EMOJI_INFO} Verbose Candidate Details ---")
-            for i, res_candidate in enumerate(self.results):
-                is_primary_for_tool = (res_candidate.interface_iid.lower(
-                ) == primary_candidate_for_stub.interface_iid.lower())
-                primary_marker = f" {EMOJI_LIGHTBULB} (Likely primary for tool)" if is_primary_for_tool else ""
-                print(
-                    f"\n  --- Verbose for Candidate {i+1}: '{res_candidate.interface_name}' (IID: {res_candidate.interface_iid}){primary_marker} ---")
-                print(f"    Methods (relevant to ABE):")
-                for name, details in res_candidate.methods.items():
-                    slot = details.ovft // ctypes.sizeof(
-                        ctypes.c_void_p) if ctypes.sizeof(ctypes.c_void_p) > 0 else "N/A"
-                    print(
-                        f"      - Method '{name}': VTable Offset: {details.ovft} (Slot ~{slot}), Defined in: '{details.defining_interface_name}' (IID: {details.defining_interface_iid})")
-                print(
-                    f"    Inheritance Chain: {' -> '.join(iface.name for iface in reversed(res_candidate.inheritance_chain_info))}")
-                for iface_in_chain in reversed(res_candidate.inheritance_chain_info):
-                    print(
-                        f"      Interface in chain: '{iface_in_chain.name}' (IID: {iface_in_chain.iid}) - Defines {len(iface_in_chain.methods_defined)} method(s):")
-                    if not iface_in_chain.methods_defined and iface_in_chain.name != "IUnknown":
-                        print(
-                            f"        (No methods directly defined in this block for '{iface_in_chain.name}')")
-                    elif iface_in_chain.name == "IUnknown":
-                        print(f"        (Standard IUnknown methods)")
-                    for md in iface_in_chain.methods_defined:
-                        print(
-                            f"        - {md.ret_type} {md.name}({', '.join(md.params) if md.params else 'void'}) (oVft: {md.ovft})")
-            print("--- End of Verbose Details ---")
+        # Verbose details
+        if self.verbose:
+            print(f"\n--- {EMOJI['info']} Verbose Candidate Details ---")
+            for i, r in enumerate(self.results):
+                print(f"\n  --- Candidate {i + 1}: '{r.interface_name}' ---")
+                print(f"    Methods (ABE):")
+                for name, m in r.methods.items():
+                    slot = m.ovft // 8
+                    print(f"      - {name}: VTable Offset {m.ovft} (Slot ~{slot}), in '{m.defining_interface_name}'")
+                print(f"    Inheritance: {' -> '.join(iface.name for iface in reversed(r.inheritance_chain_info))}")
+                for iface in reversed(r.inheritance_chain_info):
+                    print(f"      {iface.name} (IID: {iface.iid}) - {len(iface.methods_defined)} method(s)")
+                    for m in iface.methods_defined:
+                        params = ', '.join(m.params) if m.params else 'void'
+                        print(f"        - {m.ret_type} {m.name}({params}) (oVft: {m.ovft})")
+            print("--- End Verbose Details ---")
 
-        if output_cpp_stub_file and self.results:
-            self._log(
-                f"\n{EMOJI_GEAR} Generating C++ stubs for interface: '{primary_candidate_for_stub.interface_name}'...", status_emoji="")
-            header = f"// --- COM Stubs for Browser: {browser_name_print} ---\n// Generated by COM ABE Analyzer\n"
-            header += f"// Service Executable: {exe_path_print}\n"
-            header += f"// Target CLSID for CoCreateInstance: {format_guid_for_cpp(primary_candidate_for_stub.clsid)} // Original: {primary_candidate_for_stub.clsid}\n"
-            header += f"// Target IID for CoCreateInstance: {format_guid_for_cpp(primary_candidate_for_stub.interface_iid)} // Original: {primary_candidate_for_stub.interface_iid} (Primary Interface: {primary_candidate_for_stub.interface_name})\n\n"
-            content = self.generate_cpp_stub_for_chain(
-                primary_candidate_for_stub.inheritance_chain_info, primary_candidate_for_stub.interface_iid)
+        # Generate C++ stubs
+        if output_cpp_file:
+            self._log(f"\nGenerating C++ stubs for '{primary.interface_name}'...", emoji="gear")
+            header = f"// COM Stubs for {browser}\n// Generated by COMrade ABE Analyzer\n"
+            header += f"// CLSID: {format_guid_for_cpp(primary.clsid)}\n"
+            header += f"// IID: {format_guid_for_cpp(primary.interface_iid)}\n\n"
+            content = self.generate_cpp_stubs(primary.inheritance_chain_info, primary.interface_iid)
             try:
-                with open(output_cpp_stub_file, "w", encoding="utf-8") as f:
+                with open(output_cpp_file, 'w', encoding='utf-8') as f:
                     f.write(header + content)
-                self._log(
-                    f"{EMOJI_FILE} C++ stubs written to: {output_cpp_stub_file}", status_emoji=EMOJI_SUCCESS)
+                self._log(f"C++ stubs written to: {output_cpp_file}", emoji="success")
             except IOError as e:
-                self._log(f"{EMOJI_FILE} Error writing C++ stubs: {e}",
-                          status_emoji=EMOJI_FAILURE)
-                
+                self._log(f"Error writing stubs: {e}", emoji="failure")
+
+    def compare_interfaces(self, other_json: str) -> Dict[str, Any]:
+        """Compare current results with a previous JSON export."""
+        try:
+            with open(other_json, 'r', encoding='utf-8') as f:
+                other = json.load(f)
+        except Exception as e:
+            return {"error": str(e)}
+
+        diff = {
+            "added_interfaces": [], "removed_interfaces": [],
+            "method_changes": [], "vtable_offset_changes": []
+        }
+
+        current = {r.interface_iid.lower(): r for r in self.results}
+        other_results = {r["interface_iid"].lower(): r for r in other.get("results", [])}
+
+        for iid, r in current.items():
+            if iid not in other_results:
+                diff["added_interfaces"].append({"name": r.interface_name, "iid": r.interface_iid})
+
+        for iid, r in other_results.items():
+            if iid not in current:
+                diff["removed_interfaces"].append({"name": r["interface_name"], "iid": r["interface_iid"]})
+
+        return diff
+
+
+# =============================================================================
+# CLI Entry Point
+# =============================================================================
+
 def print_banner():
-    banner_art = rf"""
+    print(r"""
 -------------------------------------------------------------------------------------------
 
 _________  ________      _____                    .___          _____ _____________________
 \_   ___ \ \_____  \    /     \____________     __| _/____     /  _  \\______   \_   _____/
-/    \  \/  /   |   \  /  \ /  \_  __ \__  \   / __ |/ __ \   /  /_\  \|    |  _/|    __)_ 
+/    \  \/  /   |   \  /  \ /  \_  __ \__  \   / __ |/ __ \   /  /_\  \|    |  _/|    __)_
 \     \____/    |    \/    Y    \  | \// __ \_/ /_/ \  ___/  /    |    \    |   \|        \
  \______  /\_______  /\____|__  /__|  (____  /\____ |\___  > \____|__  /______  /_______  /
-        \/         \/         \/           \/      \/    \/          \/       \/        \/ 
+        \/         \/         \/           \/      \/    \/          \/       \/        \/
 
                   by Alexander 'xaitax' Hagenah
 -------------------------------------------------------------------------------------------
-    """
-    print(banner_art)
+    """)
 
 
-if __name__ == "__main__":
+def main():
     print_banner()
 
-    examples = """Examples:
-  Scan for Chrome ABE interface:
-    %(prog)s chrome --scan
-
-  Scan for Edge, verbose output, and save C++ stubs:
-    %(prog)s edge --scan -v --output-cpp-stub edge_abe_stubs.cpp
-
-  Analyze a specific executable directly:
-    %(prog)s "C:\\Program Files\\Google\\Chrome\\Application\\1xx.x.xxxx.xx\\elevation_service.exe"
-
-  Analyze executable with a known CLSID:
-    %(prog)s "C:\\path\\to\\service.exe" --known-clsid {YOUR-CLSID-HERE-IN-BRACES}
+    examples = """
+Examples:
+  %(prog)s chrome                    Analyze Chrome elevation service
+  %(prog)s edge -d                   Analyze Edge with SDDL + service details
+  %(prog)s brave -v -o out.json      Verbose analysis, export to JSON
+  %(prog)s discover                  List all elevation services
+  %(prog)s search Google             Search TypeLibs by name
+  %(prog)s chrome --compare old.json Compare with previous analysis
+  %(prog)s "C:\\path\\to\\exe"         Analyze specific executable
 """
 
     parser = argparse.ArgumentParser(
-        usage="%(prog)s TARGET [options]",
-        description=f"COMrade ABE: Your friendly helper for discovering and detailing COM App-Bound Encryption (ABE)\n"
-                    "interfaces in Chromium-based browsers. It identifies service executables, CLSIDs, relevant IIDs,\n"
-                    "and generates C++ stubs for security research and development.",
+        usage="%(prog)s <target> [options]",
+        description="COMrade ABE: Discover and analyze COM ABE interfaces in Chromium browsers.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=examples
     )
 
-    parser.add_argument(
-        "executable_path_or_browser_key",
-        metavar="TARGET",
-        help="Either the direct path to an executable (e.g., elevation_service.exe)\n"
-             "OR a browser key ('chrome', 'edge', 'brave') when using --scan mode."
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable detailed verbose output during the analysis process."
-    )
-    parser.add_argument(
-        "--output-cpp-stub",
-        metavar="FILE_PATH",
-        help="If specified, C++ interface stubs for the 'primary' identified ABE interface\n"
-             "will be written to this file."
-    )
-    parser.add_argument(
-        "--target-method-names",
-        default="DecryptData,EncryptData",
-        help="Comma-separated list of essential method names to identify a potential ABE interface\n"
-             "(default: DecryptData,EncryptData)."
-    )
-    parser.add_argument(
-        "--decrypt-params",
-        type=int, default=3,
-        metavar="COUNT",
-        help="Expected parameter count for the 'DecryptData' method (default: 3)."
-    )
-    parser.add_argument(
-        "--encrypt-params",
-        type=int, default=4,
-        metavar="COUNT",
-        help="Expected parameter count for the 'EncryptData' method (default: 4)."
-    )
-    parser.add_argument(
-        "--known-clsid",
-        metavar="{CLSID-GUID}",
-        help="Manually provide a CLSID (e.g., {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}) to use.\n"
-             "This can supplement or override discovery, especially useful when analyzing a\n"
-             "direct executable path without --scan, or if registry scan fails."
-    )
-    parser.add_argument(
-        "--scan",
-        action="store_true",
-        help="Enable scan mode. In this mode, TARGET should be a browser key ('chrome', 'edge', 'brave').\n"
-             "The script will attempt to find the service executable and CLSID from the registry."
-    )
-    parser.add_argument(
-        "--output-json",
-        metavar="FILE_PATH",
-        help="Export analysis results to JSON format for programmatic consumption."
-    )
-    parser.add_argument(
-        "--log-file",
-        metavar="FILE_PATH",
-        help="Write detailed logs to the specified file with timestamps."
-    )
-    
+    # Positional arguments
+    parser.add_argument("target", metavar="TARGET",
+                        help="chrome|edge|brave, 'discover', 'search', or path to executable")
+    parser.add_argument("pattern", nargs="?", default=None,
+                        help="Search pattern (only used with 'search' command)")
+
+    # Common options
+    parser.add_argument("-d", "--details", action="store_true",
+                        help="Show SDDL and service status details")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Enable verbose output")
+    parser.add_argument("-o", "--output", metavar="FILE",
+                        help="Export results to JSON")
+    parser.add_argument("--cpp", metavar="FILE",
+                        help="Generate C++ interface stubs")
+    parser.add_argument("--compare", metavar="FILE",
+                        help="Compare with previous JSON export")
+    parser.add_argument("--clsid", metavar="CLSID",
+                        help="Manually specify CLSID")
+    parser.add_argument("--log", metavar="FILE",
+                        help="Write logs to file")
+
+    # Advanced options (hidden from main help)
+    advanced = parser.add_argument_group("advanced options")
+    advanced.add_argument("--methods", default="DecryptData,EncryptData",
+                          help=argparse.SUPPRESS)
+    advanced.add_argument("--decrypt-params", type=int, default=3,
+                          help=argparse.SUPPRESS)
+    advanced.add_argument("--encrypt-params", type=int, default=4,
+                          help=argparse.SUPPRESS)
+
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
         sys.exit(1)
@@ -1119,37 +1594,121 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if sys.platform != "win32":
-        print(f"{EMOJI_FAILURE} This script relies on Windows-specific COM and registry functions and cannot run on this platform.")
+        print(f"{EMOJI['failure']} This script requires Windows.")
         sys.exit(1)
-        
-    print(f"{EMOJI_GEAR} COM ABE Interface Analyzer Initializing...")
+
+    print(f"{EMOJI['gear']} COM ABE Interface Analyzer Initializing...")
 
     analyzer = ComInterfaceAnalyzer(
         verbose=args.verbose,
-        target_method_names=[name.strip() for name in args.target_method_names.split(',')],
-        expected_decrypt_param_count=args.decrypt_params,
-        expected_encrypt_param_count=args.encrypt_params,
-        log_file=args.log_file
+        target_method_names=[m.strip() for m in args.methods.split(',')],
+        expected_decrypt_params=args.decrypt_params,
+        expected_encrypt_params=args.encrypt_params,
+        log_file=args.log
     )
 
-    if args.scan:
-        if not args.executable_path_or_browser_key:
-            parser.error("Scan mode requires a browser key (chrome, edge, brave) as TARGET.")
-        analyzer.analyze(scan_mode=True, browser_key_for_scan=args.executable_path_or_browser_key,
-                         user_provided_clsid=args.known_clsid)
+    target_lower = args.target.lower()
+    browser_keys = ["chrome", "edge", "brave"]
+
+    # Command: discover
+    if target_lower == "discover":
+        print(f"\n{EMOJI['search']} Discovering all elevation services...")
+        comtypes.CoInitialize()
+        try:
+            services = analyzer.discover_elevation_services()
+            if services:
+                print(f"\n{EMOJI['success']} Found {len(services)} elevation service(s):\n")
+                for svc in services:
+                    print(f"  {EMOJI['gear']} {svc.service_name}")
+                    print(f"      Browser Vendor : {svc.browser_vendor}")
+                    if svc.display_name:
+                        print(f"      Display Name   : {svc.display_name}")
+                    if svc.executable_path:
+                        print(f"      Executable     : {svc.executable_path}")
+                    if svc.start_type:
+                        print(f"      Start Type     : {svc.start_type}")
+                    if svc.status:
+                        emoji = EMOJI['success'] if svc.status == "running" else EMOJI['info']
+                        pid = f" (PID: {svc.pid})" if svc.pid else ""
+                        print(f"      Status         : {emoji} {svc.status}{pid}")
+                    print()
+            else:
+                print(f"{EMOJI['warning']} No elevation services found.")
+        finally:
+            comtypes.CoUninitialize()
+        print(f"{EMOJI['success']} Discovery complete.")
+        sys.exit(0)
+
+    # Command: search <pattern>
+    if target_lower == "search":
+        if not args.pattern:
+            parser.error("'search' requires a pattern. Usage: comrade_abe.py search <pattern>")
+        print(f"\n{EMOJI['search']} Searching TypeLibs matching '{args.pattern}'...")
+        comtypes.CoInitialize()
+        try:
+            typelibs = analyzer.search_typelibs_by_pattern(args.pattern)
+            if typelibs:
+                print(f"\n{EMOJI['success']} Found {len(typelibs)} matching TypeLib(s):\n")
+                for tl in typelibs:
+                    print(f"  {EMOJI['file']} {tl.name}")
+                    print(f"      TypeLib ID : {tl.typelib_id}")
+                    print(f"      Version    : {tl.version}")
+                    if tl.win64_path:
+                        print(f"      Win64 Path : {tl.win64_path}")
+                    elif tl.win32_path:
+                        print(f"      Win32 Path : {tl.win32_path}")
+                    print()
+            else:
+                print(f"{EMOJI['warning']} No TypeLibs found matching '{args.pattern}'.")
+        finally:
+            comtypes.CoUninitialize()
+        print(f"{EMOJI['success']} TypeLib search complete.")
+        sys.exit(0)
+
+    # Browser scan (chrome/edge/brave)
+    if target_lower in browser_keys:
+        analyzer.analyze(scan_mode=True, browser_key=args.target, user_clsid=args.clsid)
+    # Direct executable path
+    elif os.path.exists(args.target):
+        analyzer.executable_path = args.target
+        if args.clsid:
+            analyzer.discovered_clsid = args.clsid
+            analyzer.browser_key = "manual"
+        analyzer.analyze(user_clsid=args.clsid)
     else:
-        if not os.path.exists(args.executable_path_or_browser_key):
-            parser.error(f"Executable path not found: {args.executable_path_or_browser_key}")
-        analyzer.executable_path = args.executable_path_or_browser_key
-        if args.known_clsid:
-            analyzer.discovered_clsid = args.known_clsid
-            analyzer.browser_key = "manual_path_input"
-        analyzer.analyze(scan_mode=False, user_provided_clsid=args.known_clsid)
-    
-    analyzer.print_results(output_cpp_stub_file=args.output_cpp_stub)
-    
-    # Export to JSON if requested
-    if args.output_json and analyzer.results:
-        analyzer.export_to_json(args.output_json)
-    
-    print(f"\n{EMOJI_SUCCESS} Analysis complete.")
+        parser.error(f"Unknown target '{args.target}'. Use chrome|edge|brave, 'discover', 'search', or a valid path.")
+
+    # Print results
+    analyzer.print_results(
+        output_cpp_file=args.cpp,
+        show_sddl=args.details,
+        show_service_status=args.details
+    )
+
+    # Export JSON
+    if args.output and analyzer.results:
+        analyzer.export_to_json(args.output)
+
+    # Compare with previous
+    if args.compare and analyzer.results:
+        print(f"\n{EMOJI['search']} Comparing with: {args.compare}")
+        if os.path.exists(args.compare):
+            diff = analyzer.compare_interfaces(args.compare)
+            if "error" in diff:
+                print(f"  {EMOJI['failure']} Error: {diff['error']}")
+            elif not any(diff.values()):
+                print(f"  {EMOJI['success']} No changes detected.")
+            else:
+                print(f"\n  {EMOJI['warning']} Changes detected:")
+                for iface in diff.get("added_interfaces", []):
+                    print(f"    + {iface['name']} ({iface['iid']})")
+                for iface in diff.get("removed_interfaces", []):
+                    print(f"    - {iface['name']} ({iface['iid']})")
+        else:
+            print(f"  {EMOJI['failure']} File not found: {args.compare}")
+
+    print(f"\n{EMOJI['success']} Analysis complete.")
+
+
+if __name__ == "__main__":
+    main()
